@@ -5,7 +5,10 @@ from scipy.sparse import lil_matrix
 import torch
 import torch.optim as optim
 
-def create_bundle_adjustment_sparsity(n_cameras, n_points, camera_indices, point_indices):
+
+def create_bundle_adjustment_sparsity(
+    n_cameras, n_points, camera_indices, point_indices
+):
     """
     Creates the sparsity matrix for bundle adjustment.
 
@@ -30,6 +33,7 @@ def create_bundle_adjustment_sparsity(n_cameras, n_points, camera_indices, point
 
     return A
 
+
 def project_points(points_3d, camera_params, K):
     """
     Projects 3D points onto the image plane using given camera parameters and intrinsics.
@@ -49,7 +53,10 @@ def project_points(points_3d, camera_params, K):
         projected_points.append(np.squeeze(projected))
     return projected_points
 
-def calculate_reprojection_error(params, n_cameras, n_points, camera_indices, point_indices, points_2d, K, cuda=False):
+
+def calculate_reprojection_error(
+    params, n_cameras, n_points, camera_indices, point_indices, points_2d, K, cuda=False
+):
     """Calculates the reprojection error for a given set of camera and 3D point parameters.
 
     This function takes the current camera and 3D point parameters, projects the 3D points
@@ -97,14 +104,16 @@ def calculate_reprojection_error(params, n_cameras, n_points, camera_indices, po
     """
     # Reshape the input parameters into camera parameters and 3D points
     # Each camera has 12 parameters (e.g., rotation, translation, distortion)
-    camera_params = params[:n_cameras * 12].reshape((n_cameras, 12))
+    camera_params = params[: n_cameras * 12].reshape((n_cameras, 12))
     # Each 3D point has 3 coordinates (x, y, z)
-    points_3d = params[n_cameras * 12:].reshape((n_points, 3))
+    points_3d = params[n_cameras * 12 :].reshape((n_points, 3))
 
     # Project the 3D points onto the 2D image planes using the specified camera and point indices
     # and the intrinsic matrix K.
     # The `project_points` function is assumed to be defined elsewhere and handle the projection logic.
-    projected_points = project_points(points_3d[point_indices], camera_params[camera_indices], K)
+    projected_points = project_points(
+        points_3d[point_indices], camera_params[camera_indices], K
+    )
 
     # Calculate the reprojection error (difference between projected and observed 2D points)
     if not cuda:
@@ -114,7 +123,9 @@ def calculate_reprojection_error(params, n_cameras, n_points, camera_indices, po
         # If CUDA is requested, convert the error to a PyTorch tensor and move it to the CUDA device
         # Ensure that `projected_points` is also handled appropriately (e.g., if it's a torch tensor already)
         # Note: The original code snippet was missing `return` here, which has been added.
-        return torch.tensor((np.array(projected_points) - points_2d).ravel(), device='cuda')
+        return torch.tensor(
+            (np.array(projected_points) - points_2d).ravel(), device="cuda"
+        )
 
 
 def do_BA(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K, ftol):
@@ -140,7 +151,9 @@ def do_BA(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K, ftol
 
     for img_index in resected_imgs:
         camera_index_map[img_index] = camera_count
-        initial_camera_params.append(np.hstack((R_mats[img_index].ravel(), t_vecs[img_index].ravel())))
+        initial_camera_params.append(
+            np.hstack((R_mats[img_index].ravel(), t_vecs[img_index].ravel()))
+        )
         camera_count += 1
 
     for pt3d_idx, pt3d_with_view in enumerate(points3d_with_views):
@@ -164,36 +177,48 @@ def do_BA(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K, ftol
 
     n_cameras = initial_camera_params.shape[0]
     n_points = initial_points_3d.shape[0]
-    initial_params = np.hstack((initial_camera_params.ravel(), initial_points_3d.ravel()))
-    sparsity_matrix = create_bundle_adjustment_sparsity(n_cameras, n_points, camera_indices, point_indices)
+    initial_params = np.hstack(
+        (initial_camera_params.ravel(), initial_points_3d.ravel())
+    )
+    sparsity_matrix = create_bundle_adjustment_sparsity(
+        n_cameras, n_points, camera_indices, point_indices
+    )
 
     optimization_result = least_squares(
         calculate_reprojection_error,
         initial_params,
         jac_sparsity=sparsity_matrix,
         verbose=0,
-        x_scale='jac',
-        loss='linear',
+        x_scale="jac",
+        loss="huber",
         ftol=ftol,
-        xtol=1e-12,
-        method='trf',
-        args=(n_cameras, n_points, camera_indices, point_indices, points_2d, K)
+        xtol=1e-4,
+        gtol=1e-4,
+        method="trf",
+        max_nfev=2000,
+        f_scale=1.0,
+        args=(n_cameras, n_points, camera_indices, point_indices, points_2d, K),
     )
 
-    adjusted_camera_params = optimization_result.x[:n_cameras * 12].reshape(n_cameras, 12)
-    adjusted_points_3d = optimization_result.x[n_cameras * 12:].reshape(n_points, 3)
+    adjusted_camera_params = optimization_result.x[: n_cameras * 12].reshape(
+        n_cameras, 12
+    )
+    adjusted_points_3d = optimization_result.x[n_cameras * 12 :].reshape(n_points, 3)
     updated_R_mats = {}
     updated_t_vecs = {}
 
     for true_index, normalized_index in camera_index_map.items():
-        updated_R_mats[true_index] = adjusted_camera_params[normalized_index][:9].reshape(3, 3)
-        updated_t_vecs[true_index] = adjusted_camera_params[normalized_index][9:].reshape(3, 1)
+        updated_R_mats[true_index] = adjusted_camera_params[normalized_index][
+            :9
+        ].reshape(3, 3)
+        updated_t_vecs[true_index] = adjusted_camera_params[normalized_index][
+            9:
+        ].reshape(3, 1)
 
     for i, pt3d_with_view in enumerate(points3d_with_views):
         pt3d_with_view.point3d = adjusted_points_3d[i].reshape(1, 3)
 
     return points3d_with_views, updated_R_mats, updated_t_vecs
-
 
 
 def do_BA_cuda(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K, ftol):
@@ -208,7 +233,7 @@ def do_BA_cuda(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K,
     :param K: (3, 3) camera intrinsics matrix.
     :param ftol: Tolerance for change in the cost function for optimization.
     :return: Tuple containing updated points3d_with_views, R_mats, and t_vecs.
-    
+
     :description:
         # CUDA implementation of bundle adjustment
         # This is a simplified version of the original code
@@ -240,7 +265,9 @@ def do_BA_cuda(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K,
 
     for img_index in resected_imgs:
         camera_index_map[img_index] = camera_count
-        initial_camera_params.append(np.hstack((R_mats[img_index].ravel(), t_vecs[img_index].ravel())))
+        initial_camera_params.append(
+            np.hstack((R_mats[img_index].ravel(), t_vecs[img_index].ravel()))
+        )
         camera_count += 1
 
     for pt3d_idx, pt3d_with_view in enumerate(points3d_with_views):
@@ -264,48 +291,68 @@ def do_BA_cuda(points3d_with_views, R_mats, t_vecs, resected_imgs, keypoints, K,
 
     n_cameras = initial_camera_params.shape[0]
     n_points = initial_points_3d.shape[0]
-    initial_params = np.hstack((initial_camera_params.ravel(), initial_points_3d.ravel()))
-    sparsity_matrix = create_bundle_adjustment_sparsity(n_cameras, n_points, camera_indices, point_indices)
+    initial_params = np.hstack(
+        (initial_camera_params.ravel(), initial_points_3d.ravel())
+    )
+    sparsity_matrix = create_bundle_adjustment_sparsity(
+        n_cameras, n_points, camera_indices, point_indices
+    )
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
-    
+
     # Optimizer setup
-    params = torch.tensor(initial_params, dtype=torch.float32, device=device, requires_grad=True)
+    params = torch.tensor(
+        initial_params, dtype=torch.float32, device=device, requires_grad=True
+    )
     optimizer = optim.LBFGS([params], lr=1, max_iter=50, history_size=10)
-    
+
     # Define closure for LBFGS
     def closure():
         optimizer.zero_grad()
-        reprojection_error = calculate_reprojection_error(params, n_cameras, n_points, camera_indices, point_indices, points_2d, K, cuda=True)
+        reprojection_error = calculate_reprojection_error(
+            params,
+            n_cameras,
+            n_points,
+            camera_indices,
+            point_indices,
+            points_2d,
+            K,
+            cuda=True,
+        )
         loss = reprojection_error.pow(2).sum()
         loss.backward()
         return loss
 
     optimizer.step(closure)
-    
-    
+
     optimization_result = least_squares(
         calculate_reprojection_error,
         initial_params,
         jac_sparsity=sparsity_matrix,
         verbose=2,
-        x_scale='jac',
-        loss='linear',
+        x_scale="jac",
+        loss="linear",
         ftol=ftol,
         xtol=1e-12,
-        method='trf',
-        args=(n_cameras, n_points, camera_indices, point_indices, points_2d, K)
+        method="trf",
+        args=(n_cameras, n_points, camera_indices, point_indices, points_2d, K),
     )
 
-    adjusted_camera_params = optimization_result.x[:n_cameras * 12].reshape(n_cameras, 12)
-    adjusted_points_3d = optimization_result.x[n_cameras * 12:].reshape(n_points, 3)
+    adjusted_camera_params = optimization_result.x[: n_cameras * 12].reshape(
+        n_cameras, 12
+    )
+    adjusted_points_3d = optimization_result.x[n_cameras * 12 :].reshape(n_points, 3)
     updated_R_mats = {}
     updated_t_vecs = {}
 
     for true_index, normalized_index in camera_index_map.items():
-        updated_R_mats[true_index] = adjusted_camera_params[normalized_index][:9].reshape(3, 3)
-        updated_t_vecs[true_index] = adjusted_camera_params[normalized_index][9:].reshape(3, 1)
+        updated_R_mats[true_index] = adjusted_camera_params[normalized_index][
+            :9
+        ].reshape(3, 3)
+        updated_t_vecs[true_index] = adjusted_camera_params[normalized_index][
+            9:
+        ].reshape(3, 1)
 
     for i, pt3d_with_view in enumerate(points3d_with_views):
         pt3d_with_view.point3d = adjusted_points_3d[i].reshape(1, 3)
@@ -323,70 +370,95 @@ def project_points_torch(points_3d_obs, R_matrices_obs, t_vectors_obs, K_tensor)
     Returns: Tensor of shape (N_obs, 2), projected 2D points.
     """
     N_obs = points_3d_obs.shape[0]
-    
+
     # Transform to camera coordinates: P_cam = R @ P_world + t
     # R_matrices_obs @ points_3d_obs.unsqueeze(2) -> (N_obs, 3, 1)
     points_cam = R_matrices_obs @ points_3d_obs.unsqueeze(2) + t_vectors_obs
-    
+
     # Project to image plane: p_img_homogeneous = K @ P_cam
     # K_tensor @ points_cam -> (N_obs, 3, 1)
     points_homogeneous_img = K_tensor @ points_cam
-    
+
     # Normalize by the z-coordinate (perspective division)
     # Add a small epsilon to prevent division by zero and handle points behind camera.
     # A more robust solution would involve checking z > 0.
     epsilon = 1e-8
     z_coords = points_homogeneous_img[:, 2, 0]
-    
+
     # Clamp z_coords to avoid negative or very small z issues leading to NaNs or Infs
     # This is a practical heuristic; proper handling involves checking visibility.
     z_coords_clamped = torch.clamp(z_coords, min=epsilon)
 
     projected_u = points_homogeneous_img[:, 0, 0] / z_coords_clamped
     projected_v = points_homogeneous_img[:, 1, 0] / z_coords_clamped
-    
-    projected_2d = torch.stack((projected_u, projected_v), dim=1) # Shape: (N_obs, 2)
+
+    projected_2d = torch.stack((projected_u, projected_v), dim=1)  # Shape: (N_obs, 2)
     return projected_2d
 
-def calculate_reprojection_error_torch(params_tensor, n_cameras_optim, n_points_optim,
-                                     camera_indices_tensor, point_indices_tensor,
-                                     points_2d_tensor, K_tensor):
+
+def calculate_reprojection_error_torch(
+    params_tensor,
+    n_cameras_optim,
+    n_points_optim,
+    camera_indices_tensor,
+    point_indices_tensor,
+    points_2d_tensor,
+    K_tensor,
+):
     """
     Calculates the reprojection error for bundle adjustment using PyTorch.
     params_tensor: 1D tensor. Contains n_cameras_optim*12 camera parameters (9 for R, 3 for t)
                    followed by n_points_optim*3 for 3D point coordinates.
     """
-    num_cam_params_per_cam = 12 # 9 for R (3x3 matrix) + 3 for t
-    
+    num_cam_params_per_cam = 12  # 9 for R (3x3 matrix) + 3 for t
+
     # Extract camera parameters and 3D points from the flat params_tensor
-    camera_params_flat = params_tensor[:n_cameras_optim * num_cam_params_per_cam]
-    points_3d_flat = params_tensor[n_cameras_optim * num_cam_params_per_cam:]
-    
+    camera_params_flat = params_tensor[: n_cameras_optim * num_cam_params_per_cam]
+    points_3d_flat = params_tensor[n_cameras_optim * num_cam_params_per_cam :]
+
     # Reshape to get per-camera parameters and per-point coordinates
-    all_camera_params_optim = camera_params_flat.reshape(n_cameras_optim, num_cam_params_per_cam)
+    all_camera_params_optim = camera_params_flat.reshape(
+        n_cameras_optim, num_cam_params_per_cam
+    )
     all_points_3d_optim = points_3d_flat.reshape(n_points_optim, 3)
-    
+
     # Select the specific camera parameters and 3D points for each observation
     # using the mapped indices
     observed_camera_params = all_camera_params_optim[camera_indices_tensor]
     observed_points_3d = all_points_3d_optim[point_indices_tensor]
-    
+
     # Extract R (rotation matrices) and t (translation vectors) for each observation
     R_matrices_obs = observed_camera_params[:, :9].reshape(-1, 3, 3)
-    t_vectors_obs = observed_camera_params[:, 9:].reshape(-1, 3, 1) # Ensure it's a column vector
-    
+    t_vectors_obs = observed_camera_params[:, 9:].reshape(
+        -1, 3, 1
+    )  # Ensure it's a column vector
+
     # Project points
-    projected_points_obs = project_points_torch(observed_points_3d, R_matrices_obs, t_vectors_obs, K_tensor)
-    
+    projected_points_obs = project_points_torch(
+        observed_points_3d, R_matrices_obs, t_vectors_obs, K_tensor
+    )
+
     # Calculate error
-    error = (projected_points_obs - points_2d_tensor).ravel() # Flatten to 1D for loss calculation
+    error = (
+        projected_points_obs - points_2d_tensor
+    ).ravel()  # Flatten to 1D for loss calculation
     return error
+
 
 # --- Main PyTorch Bundle Adjustment Function ---
 
-def do_BA_pytorch(points3d_with_views, R_mats, t_vecs, resected_imgs_orig_indices, 
-                  all_keypoints, K_np, n_iterations=100, learning_rate=1e-3,
-                  apply_orthogonalization=True):
+
+def do_BA_pytorch(
+    points3d_with_views,
+    R_mats,
+    t_vecs,
+    resected_imgs_orig_indices,
+    all_keypoints,
+    K_np,
+    n_iterations=100,
+    learning_rate=1e-3,
+    apply_orthogonalization=True,
+):
     """
     Performs bundle adjustment using PyTorch on GPU if available.
 
@@ -404,22 +476,29 @@ def do_BA_pytorch(points3d_with_views, R_mats, t_vecs, resected_imgs_orig_indice
     Returns:
         Updated points3d_with_views, R_mats, t_vecs.
     """
-    
+
     print(f"Starting PyTorch BA for {len(resected_imgs_orig_indices)} cameras.")
 
     # 1. Prepare data and mappings
     # Map original camera indices to new dense indices (0 to n_cameras_optim-1) for optimization
-    cam_orig_to_optim_idx = {orig_idx: i for i, orig_idx in enumerate(sorted(list(resected_imgs_orig_indices)))}
+    cam_orig_to_optim_idx = {
+        orig_idx: i
+        for i, orig_idx in enumerate(sorted(list(resected_imgs_orig_indices)))
+    }
     n_cameras_optim = len(cam_orig_to_optim_idx)
-    
+
     initial_camera_params_list = [None] * n_cameras_optim
     for orig_idx, optim_idx in cam_orig_to_optim_idx.items():
         if orig_idx in R_mats and orig_idx in t_vecs:
-            initial_camera_params_list[optim_idx] = np.hstack((R_mats[orig_idx].ravel(), t_vecs[orig_idx].ravel()))
+            initial_camera_params_list[optim_idx] = np.hstack(
+                (R_mats[orig_idx].ravel(), t_vecs[orig_idx].ravel())
+            )
         else:
-            print(f"Warning: Camera original index {orig_idx} not found in R_mats/t_vecs during BA prep.")
+            print(
+                f"Warning: Camera original index {orig_idx} not found in R_mats/t_vecs during BA prep."
+            )
             # Handle this case: skip BA or raise error
-            return points3d_with_views, R_mats, t_vecs 
+            return points3d_with_views, R_mats, t_vecs
 
     if any(p is None for p in initial_camera_params_list):
         print("Error: Could not initialize all camera parameters for BA.")
@@ -429,11 +508,11 @@ def do_BA_pytorch(points3d_with_views, R_mats, t_vecs, resected_imgs_orig_indice
 
     # Prepare 3D points and observations
     # Map original Point3DWithViews object's list index to new dense point index (0 to n_points_optim-1)
-    pt3d_orig_list_idx_to_optim_idx = {} 
+    pt3d_orig_list_idx_to_optim_idx = {}
     optim_idx_to_pt3d_orig_list_idx = {}
 
     current_optim_pt_idx = 0
-    
+
     obs_cam_optim_indices = []
     obs_pt_optim_indices = []
     obs_points_2d_list = []
@@ -442,11 +521,14 @@ def do_BA_pytorch(points3d_with_views, R_mats, t_vecs, resected_imgs_orig_indice
     for i_orig_list_idx, pt3d_obj in enumerate(points3d_with_views):
         is_observed_by_active_cam = False
         # Check if this 3D point is observed by any of the cameras active in this BA run
-        for cam_orig_idx_viewing_pt, kpt_idx_in_cam in pt3d_obj.source_2dpt_idxs.items():
+        for (
+            cam_orig_idx_viewing_pt,
+            kpt_idx_in_cam,
+        ) in pt3d_obj.source_2dpt_idxs.items():
             if cam_orig_idx_viewing_pt in cam_orig_to_optim_idx:
                 is_observed_by_active_cam = True
-                break # Found at least one active camera observing this point
-        
+                break  # Found at least one active camera observing this point
+
         if is_observed_by_active_cam:
             # This 3D point is part of the optimization
             pt3d_orig_list_idx_to_optim_idx[i_orig_list_idx] = current_optim_pt_idx
@@ -454,88 +536,120 @@ def do_BA_pytorch(points3d_with_views, R_mats, t_vecs, resected_imgs_orig_indice
             initial_points_3d_optim_list.append(pt3d_obj.point3d.flatten())
 
             # Add all its observations from active cameras
-            for cam_orig_idx_viewing_pt, kpt_idx_in_cam in pt3d_obj.source_2dpt_idxs.items():
+            for (
+                cam_orig_idx_viewing_pt,
+                kpt_idx_in_cam,
+            ) in pt3d_obj.source_2dpt_idxs.items():
                 if cam_orig_idx_viewing_pt in cam_orig_to_optim_idx:
-                    obs_cam_optim_indices.append(cam_orig_to_optim_idx[cam_orig_idx_viewing_pt])
+                    obs_cam_optim_indices.append(
+                        cam_orig_to_optim_idx[cam_orig_idx_viewing_pt]
+                    )
                     obs_pt_optim_indices.append(current_optim_pt_idx)
-                    obs_points_2d_list.append(all_keypoints[cam_orig_idx_viewing_pt][kpt_idx_in_cam].pt)
+                    obs_points_2d_list.append(
+                        all_keypoints[cam_orig_idx_viewing_pt][kpt_idx_in_cam].pt
+                    )
             current_optim_pt_idx += 1
 
     if not initial_points_3d_optim_list or not obs_points_2d_list:
-        print("Warning: No 3D points observed by active cameras, or no 2D observations. Skipping BA.")
+        print(
+            "Warning: No 3D points observed by active cameras, or no 2D observations. Skipping BA."
+        )
         return points3d_with_views, R_mats, t_vecs
-        
+
     n_points_optim = len(initial_points_3d_optim_list)
     initial_points_3d_np = np.array(initial_points_3d_optim_list, dtype=np.float32)
-    
+
     obs_cam_optim_indices_np = np.array(obs_cam_optim_indices, dtype=np.int32)
     obs_pt_optim_indices_np = np.array(obs_pt_optim_indices, dtype=np.int32)
     obs_points_2d_np = np.array(obs_points_2d_list, dtype=np.float32)
 
     # Combine into a single parameter vector for PyTorch
-    initial_params_np = np.hstack((initial_camera_params_np.ravel(), initial_points_3d_np.ravel()))
+    initial_params_np = np.hstack(
+        (initial_camera_params_np.ravel(), initial_points_3d_np.ravel())
+    )
 
     # 2. PyTorch Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using PyTorch device: {device}")
 
-    params_tensor = torch.tensor(initial_params_np, dtype=torch.float32, device=device, requires_grad=True)
-    cam_indices_tensor = torch.tensor(obs_cam_optim_indices_np, dtype=torch.long, device=device)
-    pt_indices_tensor = torch.tensor(obs_pt_optim_indices_np, dtype=torch.long, device=device)
+    params_tensor = torch.tensor(
+        initial_params_np, dtype=torch.float32, device=device, requires_grad=True
+    )
+    cam_indices_tensor = torch.tensor(
+        obs_cam_optim_indices_np, dtype=torch.long, device=device
+    )
+    pt_indices_tensor = torch.tensor(
+        obs_pt_optim_indices_np, dtype=torch.long, device=device
+    )
     pts_2d_tensor = torch.tensor(obs_points_2d_np, dtype=torch.float32, device=device)
-    K_tensor = torch.tensor(K_np, dtype=torch.float32, device=device) # K_np should be float
+    K_tensor = torch.tensor(
+        K_np, dtype=torch.float32, device=device
+    )  # K_np should be float
 
     # Optimizer
     optimizer = optim.Adam([params_tensor], lr=learning_rate)
 
-    print(f"Optimizing {n_cameras_optim} cameras, {n_points_optim} points, {len(obs_points_2d_list)} observations.")
+    print(
+        f"Optimizing {n_cameras_optim} cameras, {n_points_optim} points, {len(obs_points_2d_list)} observations."
+    )
 
     # 3. Optimization Loop
     for i in range(n_iterations):
         optimizer.zero_grad()
         reprojection_errors = calculate_reprojection_error_torch(
-            params_tensor, n_cameras_optim, n_points_optim,
-            cam_indices_tensor, pt_indices_tensor, pts_2d_tensor, K_tensor
+            params_tensor,
+            n_cameras_optim,
+            n_points_optim,
+            cam_indices_tensor,
+            pt_indices_tensor,
+            pts_2d_tensor,
+            K_tensor,
         )
-        loss = reprojection_errors.pow(2).sum() # Sum of squared errors
+        loss = reprojection_errors.pow(2).sum()  # Sum of squared errors
         loss.backward()
         optimizer.step()
-        
-        if (i + 1) % (n_iterations // 10 if n_iterations >=10 else 1) == 0:
+
+        if (i + 1) % (n_iterations // 10 if n_iterations >= 10 else 1) == 0:
             print(f"Iteration {i+1}/{n_iterations}, Loss: {loss.item():.4e}")
 
     print(f"PyTorch BA finished. Final Loss: {loss.item():.4e}")
 
     # 4. Retrieve and Update Parameters
     optimized_params_np = params_tensor.detach().cpu().numpy()
-    
-    num_cam_params_per_cam = 12
-    adj_cam_params_flat = optimized_params_np[:n_cameras_optim * num_cam_params_per_cam]
-    adj_pts_3d_flat = optimized_params_np[n_cameras_optim * num_cam_params_per_cam:]
 
-    adj_cam_params_optim = adj_cam_params_flat.reshape(n_cameras_optim, num_cam_params_per_cam)
+    num_cam_params_per_cam = 12
+    adj_cam_params_flat = optimized_params_np[
+        : n_cameras_optim * num_cam_params_per_cam
+    ]
+    adj_pts_3d_flat = optimized_params_np[n_cameras_optim * num_cam_params_per_cam :]
+
+    adj_cam_params_optim = adj_cam_params_flat.reshape(
+        n_cameras_optim, num_cam_params_per_cam
+    )
     adj_pts_3d_optim = adj_pts_3d_flat.reshape(n_points_optim, 3)
 
     # Update R_mats and t_vecs
     for orig_idx, optim_idx in cam_orig_to_optim_idx.items():
         R_flat = adj_cam_params_optim[optim_idx][:9]
         R = R_flat.reshape(3, 3)
-        
+
         if apply_orthogonalization:
             # Ensure R is a valid rotation matrix (orthogonalization)
             U, _, Vt = np.linalg.svd(R)
             R_ortho = U @ Vt
-            if np.linalg.det(R_ortho) < 0: # Ensure it's a right-handed system
-                 Vt[-1,:] *= -1
-                 R_ortho = U @ Vt
+            if np.linalg.det(R_ortho) < 0:  # Ensure it's a right-handed system
+                Vt[-1, :] *= -1
+                R_ortho = U @ Vt
             R_mats[orig_idx] = R_ortho
         else:
             R_mats[orig_idx] = R
-            
+
         t_vecs[orig_idx] = adj_cam_params_optim[optim_idx][9:].reshape(3, 1)
 
     # Update points3d_with_views
     for optim_pt_idx, i_orig_list_idx in optim_idx_to_pt3d_orig_list_idx.items():
-        points3d_with_views[i_orig_list_idx].point3d = adj_pts_3d_optim[optim_pt_idx].reshape(1, 3)
-        
+        points3d_with_views[i_orig_list_idx].point3d = adj_pts_3d_optim[
+            optim_pt_idx
+        ].reshape(1, 3)
+
     return points3d_with_views, R_mats, t_vecs
