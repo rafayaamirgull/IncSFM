@@ -3,7 +3,7 @@ import numpy as np
 from typing import List, Dict # Ensure List is imported
 
 # Assuming matching.py and utils.py are accessible in the same environment or path
-from feature_correspondence.sift.matching import FeatureMatcher
+from feature_correspondence.thirdparty.sift.matching import FeatureMatcher
 
 # Define an abstract base class for feature extraction and matching
 class FeatureExtractorMatcher(abc.ABC):
