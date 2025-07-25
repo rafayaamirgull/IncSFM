@@ -11,7 +11,7 @@ from sklearn.metrics.pairwise import euclidean_distances, cosine_similarity
 
 # Local imports (ensure these files are in the same directory or properly installed)
 import bundle_adjustment as b
-from matching import FeatureMatcher  # Import specific classes/functions
+# Removed direct import of FeatureMatcher, now handled by the factory
 from reconstruction import ReconstructionPipeline
 
 # Import BoVW functions and constants from utils
@@ -26,6 +26,9 @@ from utils import (
     match_images_bovw_tfidf,
     VOCABULARY_SIZE,
 )
+
+# Import the FeatureExtractorMatcherFactory
+from feature_correspondence.feature_correspondence import FeatureExtractorMatcherFactory
 
 
 # --- Configuration and Constants ---
@@ -52,10 +55,6 @@ VOXEL_VISUALIZATION_THRESHOLD = (
     100  # Max sum of absolute coords for visualization filtering
 )
 DEFAULT_VOXELS = 100  # Set to 100 for faster visualization, 200 for higher resolution.
-
-# --- BoVW Configuration and Functions (Removed from here, now in utils.py) ---
-# The actual functions and their configurations are now in utils.py.
-# This section remains only for historical context/clarity.
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -119,6 +118,13 @@ def parse_arguments() -> argparse.Namespace:
         default=True,
         help="Set to True to use BoVW for selecting the next best image pair. Default: True",
     )
+    parser.add_argument(
+        "--feature_method",
+        type=str,
+        default="sift",
+        help="Feature extraction and matching method to use ('sift' or 'xfeat'). Default: sift",
+    )
+
 
     args = parser.parse_args()
     logging.info(f"Parsed arguments: {args}")
@@ -181,7 +187,7 @@ def visualize_reconstruction(
     )
     # Ensure n_imgs is accurate or derived from len(images_paths_for_export)
     images_color_data = get_images(
-        base_path, imgset, img_type, len(images_paths_for_export)
+        base_path, imgset, img_type, len(images_paths_for_export), type_="color"
     )
 
     chosen_color_strategy = "average"  # Or "first" or "median"
@@ -225,6 +231,7 @@ def main():
     img_type = args.img_type
     USE_BOVW_FOR_INITIAL_PAIR = args.use_bovw_for_initial_pair
     USE_BOVW_FOR_NEXT_BEST_PAIR = args.use_bovw_for_next_best_pair
+    feature_method = args.feature_method # Get the chosen feature method
     print("Using following settings:    ", args)
 
     K = parse_k_matrix(args.k_matrix)
@@ -238,20 +245,43 @@ def main():
         exit(1)
 
     # Load images in grayscale for feature extraction
-    images = get_images(base_path, imgset, img_type, n_imgs, "gray")
+    images_gray = get_images(base_path, imgset, img_type, n_imgs, "gray")
+    # Load images in color for plotting purposes (if save_plots is True)
+    images_color = get_images(base_path, imgset, img_type, n_imgs, "color")
 
-    if not images:
+
+    if not images_gray:
         logging.error("No images loaded. Exiting.")
         exit(1)
 
-    img_h, img_w = images[0].shape[:2]
+    img_h, img_w = images_gray[0].shape[:2]
     logging.info(
-        f"\n======== Using total {len(images)} images of dataset {imgset} (Resolution: {img_w}x{img_h}) ========\n"
+        f"\n======== Using total {len(images_gray)} images of dataset {imgset} (Resolution: {img_w}x{img_h}) ========\n"
     )
 
-    # --- Step 1: Feature Extraction and Matching (Original Pipeline) ---
-    feam_pipeline = FeatureMatcher()
-    processed_data = feam_pipeline.process_images(images)
+    # --- Step 1: Feature Extraction and Matching using Factory Method ---
+    logging.info(f"Initializing feature extractor/matcher for method: {feature_method}")
+    try:
+        # Use the factory to create the appropriate feature extractor and matcher object
+        extractor_matcher = FeatureExtractorMatcherFactory.create_extractor_matcher(feature_method)
+
+        # Call the process method on the created object
+        # Pass the loaded grayscale images and plotting parameters
+        processed_data = extractor_matcher.process(
+            images_gray,
+            save_plot=SAVE_PLOTS,
+            dataset_name=imgset,
+            images_color_for_plotting=images_color
+        )
+        logging.info(f"Feature extraction and matching completed using {processed_data['method']}.")
+
+    except ValueError as e:
+        logging.error(f"Error initializing feature matcher: {e}")
+        exit(1)
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during feature processing: {e}")
+        exit(1)
+
 
     # Extract all descriptors for BoVW processing
     all_image_descriptors = processed_data["descriptors"]
@@ -319,8 +349,8 @@ def main():
         max_similarity = -1.0  # Cosine similarity ranges from -1 to 1
 
         candidate_pairs = []
-        for i in range(len(images)):
-            for j in range(i + 1, len(images)):
+        for i in range(len(images_gray)):
+            for j in range(i + 1, len(images_gray)):
                 # Only consider pairs that have geometric matches from FeatureMatcher
                 if (i, j) in processed_data["filtered_matches"] and len(
                     processed_data["filtered_matches"][(i, j)]
@@ -390,7 +420,7 @@ def main():
     t_vecs = {best_pair[0]: t0, best_pair[1]: t1}
 
     resected_imgs = [best_pair[0], best_pair[1]]
-    unresected_imgs = [i for i in range(len(images)) if i not in resected_imgs]
+    unresected_imgs = [i for i in range(len(images_gray)) if i not in resected_imgs]
     logging.info(f"Initial image pair: {resected_imgs}")
 
     # Calculate Bundle Adjustment checkpoints dynamically
