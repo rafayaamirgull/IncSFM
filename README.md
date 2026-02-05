@@ -1,4 +1,4 @@
-# 3D Scene Reconstruction from Photos 🏙️➡️🖥️
+# Panoptic 3D Scene Reconstruction from Photos 🏙️➡️🖥️
 
 ![](assets/gifs/unknown_object.gif)
 
@@ -49,7 +49,13 @@ pip install -r requirements.txt
 ### 2. Run the program:
 
 ```bash
-python3 main.py
+XFEAT_DEVICE=cuda XFEAT_MODEL_SOURCE=auto ./incsfm/bin/python main_runtime.py --feature_method xfeat --n_imgs 8 --use_bovw_for_initial_pair false --use_bovw_for_next_best_pair false
+```
+
+or
+
+```bash
+XFEAT_DEVICE=cpu XFEAT_MODEL_SOURCE=auto ./incsfm/bin/python main_runtime.py --feature_method xfeat --n_imgs 8 --use_bovw_for_initial_pair false --use_bovw_for_next_best_pair false
 ```
 
 Other arguments can be added to the command line, for example:

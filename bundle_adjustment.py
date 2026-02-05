@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import cv2
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
@@ -458,6 +459,13 @@ def do_BA_pytorch(
     n_iterations=100,
     learning_rate=1e-3,
     apply_orthogonalization=True,
+    loss_type="huber",
+    huber_delta=1.0,
+    early_stop_patience=25,
+    early_stop_tol=1e-4,
+    max_points=None,
+    min_track_length=2,
+    device_override=None,
 ):
     """
     Performs bundle adjustment using PyTorch on GPU if available.
@@ -477,6 +485,26 @@ def do_BA_pytorch(
         Updated points3d_with_views, R_mats, t_vecs.
     """
 
+    # Allow environment overrides without touching callers.
+    loss_type = os.getenv("BA_LOSS_TYPE", loss_type)
+    huber_delta = float(os.getenv("BA_HUBER_DELTA", huber_delta))
+    early_stop_patience = int(os.getenv("BA_EARLY_STOP_PATIENCE", early_stop_patience))
+    early_stop_tol = float(os.getenv("BA_EARLY_STOP_TOL", early_stop_tol))
+    max_points_env = os.getenv("BA_MAX_POINTS")
+    if max_points is None and max_points_env:
+        try:
+            max_points = int(max_points_env)
+        except ValueError:
+            max_points = None
+    min_track_length_env = os.getenv("BA_MIN_TRACK_LENGTH")
+    if min_track_length is None and min_track_length_env:
+        try:
+            min_track_length = int(min_track_length_env)
+        except ValueError:
+            min_track_length = 2
+    if device_override is None:
+        device_override = os.getenv("BA_DEVICE")
+
     print(f"Starting PyTorch BA for {len(resected_imgs_orig_indices)} cameras.")
 
     # 1. Prepare data and mappings
@@ -486,6 +514,38 @@ def do_BA_pytorch(
         for i, orig_idx in enumerate(sorted(list(resected_imgs_orig_indices)))
     }
     n_cameras_optim = len(cam_orig_to_optim_idx)
+
+    # Local/global overrides based on active camera count
+    global_min_cams = int(os.getenv("BA_GLOBAL_MIN_CAMERAS", "10"))
+    if n_cameras_optim >= global_min_cams:
+        max_points_global = os.getenv("BA_MAX_POINTS_GLOBAL")
+        if max_points_global:
+            try:
+                max_points = int(max_points_global)
+            except ValueError:
+                pass
+        min_track_global = os.getenv("BA_MIN_TRACK_LENGTH_GLOBAL")
+        if min_track_global:
+            try:
+                min_track_length = int(min_track_global)
+            except ValueError:
+                pass
+    else:
+        max_points_local = os.getenv("BA_MAX_POINTS_LOCAL")
+        if max_points_local:
+            try:
+                max_points = int(max_points_local)
+            except ValueError:
+                pass
+        min_track_local = os.getenv("BA_MIN_TRACK_LENGTH_LOCAL")
+        if min_track_local:
+            try:
+                min_track_length = int(min_track_local)
+            except ValueError:
+                pass
+
+    if min_track_length is None:
+        min_track_length = 2
 
     initial_camera_params_list = [None] * n_cameras_optim
     for orig_idx, optim_idx in cam_orig_to_optim_idx.items():
@@ -518,37 +578,36 @@ def do_BA_pytorch(
     obs_points_2d_list = []
     initial_points_3d_optim_list = []
 
+    # Build candidate points with active observations
+    candidates = []
     for i_orig_list_idx, pt3d_obj in enumerate(points3d_with_views):
-        is_observed_by_active_cam = False
-        # Check if this 3D point is observed by any of the cameras active in this BA run
-        for (
-            cam_orig_idx_viewing_pt,
-            kpt_idx_in_cam,
-        ) in pt3d_obj.source_2dpt_idxs.items():
+        active_views = []
+        for cam_orig_idx_viewing_pt in pt3d_obj.source_2dpt_idxs.keys():
             if cam_orig_idx_viewing_pt in cam_orig_to_optim_idx:
-                is_observed_by_active_cam = True
-                break  # Found at least one active camera observing this point
+                active_views.append(cam_orig_idx_viewing_pt)
 
-        if is_observed_by_active_cam:
-            # This 3D point is part of the optimization
-            pt3d_orig_list_idx_to_optim_idx[i_orig_list_idx] = current_optim_pt_idx
-            optim_idx_to_pt3d_orig_list_idx[current_optim_pt_idx] = i_orig_list_idx
-            initial_points_3d_optim_list.append(pt3d_obj.point3d.flatten())
+        if len(active_views) >= min_track_length:
+            candidates.append((len(active_views), i_orig_list_idx, active_views))
 
-            # Add all its observations from active cameras
-            for (
-                cam_orig_idx_viewing_pt,
-                kpt_idx_in_cam,
-            ) in pt3d_obj.source_2dpt_idxs.items():
-                if cam_orig_idx_viewing_pt in cam_orig_to_optim_idx:
-                    obs_cam_optim_indices.append(
-                        cam_orig_to_optim_idx[cam_orig_idx_viewing_pt]
-                    )
-                    obs_pt_optim_indices.append(current_optim_pt_idx)
-                    obs_points_2d_list.append(
-                        all_keypoints[cam_orig_idx_viewing_pt][kpt_idx_in_cam].pt
-                    )
-            current_optim_pt_idx += 1
+    if max_points is not None and max_points > 0 and len(candidates) > max_points:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates = candidates[:max_points]
+
+    for _, i_orig_list_idx, active_views in candidates:
+        pt3d_obj = points3d_with_views[i_orig_list_idx]
+        pt3d_orig_list_idx_to_optim_idx[i_orig_list_idx] = current_optim_pt_idx
+        optim_idx_to_pt3d_orig_list_idx[current_optim_pt_idx] = i_orig_list_idx
+        initial_points_3d_optim_list.append(pt3d_obj.point3d.flatten())
+
+        for cam_orig_idx_viewing_pt in active_views:
+            kpt_idx_in_cam = pt3d_obj.source_2dpt_idxs[cam_orig_idx_viewing_pt]
+            obs_cam_optim_indices.append(cam_orig_to_optim_idx[cam_orig_idx_viewing_pt])
+            obs_pt_optim_indices.append(current_optim_pt_idx)
+            obs_points_2d_list.append(
+                all_keypoints[cam_orig_idx_viewing_pt][kpt_idx_in_cam].pt
+            )
+
+        current_optim_pt_idx += 1
 
     if not initial_points_3d_optim_list or not obs_points_2d_list:
         print(
@@ -569,7 +628,10 @@ def do_BA_pytorch(
     )
 
     # 2. PyTorch Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_override:
+        device = torch.device(device_override)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using PyTorch device: {device}")
 
     params_tensor = torch.tensor(
@@ -594,8 +656,11 @@ def do_BA_pytorch(
     )
 
     # 3. Optimization Loop
+    prev_loss = None
+    bad_iters = 0
+
     for i in range(n_iterations):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         reprojection_errors = calculate_reprojection_error_torch(
             params_tensor,
             n_cameras_optim,
@@ -605,12 +670,36 @@ def do_BA_pytorch(
             pts_2d_tensor,
             K_tensor,
         )
-        loss = reprojection_errors.pow(2).sum()  # Sum of squared errors
+
+        if loss_type == "huber":
+            abs_err = reprojection_errors.abs()
+            quadratic = torch.clamp(abs_err, max=huber_delta)
+            linear = abs_err - quadratic
+            loss = (0.5 * quadratic.pow(2) + huber_delta * linear).sum()
+        else:
+            loss = reprojection_errors.pow(2).sum()  # Sum of squared errors
+
         loss.backward()
         optimizer.step()
 
+        loss_val = loss.item()
         if (i + 1) % (n_iterations // 10 if n_iterations >= 10 else 1) == 0:
-            print(f"Iteration {i+1}/{n_iterations}, Loss: {loss.item():.4e}")
+            print(f"Iteration {i+1}/{n_iterations}, Loss: {loss_val:.4e}")
+
+        if early_stop_patience and prev_loss is not None:
+            improvement = prev_loss - loss_val
+            if improvement < early_stop_tol * max(1.0, prev_loss):
+                bad_iters += 1
+            else:
+                bad_iters = 0
+
+            if bad_iters >= early_stop_patience:
+                print(
+                    f"Early stopping at iteration {i+1} (no significant improvement)."
+                )
+                break
+
+        prev_loss = loss_val
 
     print(f"PyTorch BA finished. Final Loss: {loss.item():.4e}")
 

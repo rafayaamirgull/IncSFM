@@ -86,8 +86,15 @@ class FeatureMatcher:
         num_images = len(image_descriptors)
         raw_matches_map: Dict[Tuple[int, int], List[cv2.DMatch]] = {}
 
+        pair_window_env = os.getenv("SIFT_PAIR_WINDOW") or os.getenv("PAIR_WINDOW")
+        max_matches_env = os.getenv("SIFT_MAX_MATCHES_PER_PAIR")
+        pair_window = int(pair_window_env) if pair_window_env else 0
+        max_matches = int(max_matches_env) if max_matches_env else 0
+
         for i in range(num_images):
-            for j in range(i + 1, num_images):
+            j_start = i + 1
+            j_end = num_images if pair_window <= 0 else min(num_images, i + 1 + pair_window)
+            for j in range(j_start, j_end):
                 desc1 = image_descriptors[i]
                 desc2 = image_descriptors[j]
                 # Skip if either image has no descriptors
@@ -105,6 +112,9 @@ class FeatureMatcher:
                 for m, n in knn_matches:
                     if m.distance < self.ratio_threshold * n.distance:
                         good_matches.append(m)
+
+                if max_matches > 0 and len(good_matches) > max_matches:
+                    good_matches = sorted(good_matches, key=lambda m: m.distance)[:max_matches]
 
                 raw_matches_map[(i, j)] = good_matches
                 print(

@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import random
 import cv2
 from typing import Tuple, List, Dict, Optional, Union
@@ -252,34 +253,74 @@ class ReconstructionPipeline:
         point_4d_hom = cv2.triangulatePoints(P_l, P_r, kpts_i, kpts_j)
         points_3D = cv2.convertPointsFromHomogeneous(point_4d_hom.T)
 
+        # Filtering: cheirality, reprojection error, triangulation angle
+        tri_min_depth = float(os.getenv("TRI_MIN_DEPTH", "1e-3"))
+        tri_max_reproj = float(os.getenv("TRI_MAX_REPROJ", "4.0"))
+        tri_min_angle_deg = float(os.getenv("TRI_MIN_ANGLE", "1.5"))
+        tri_min_angle = np.deg2rad(tri_min_angle_deg)
+
+        # Precompute projections for reprojection error
+        rvec_l, _ = cv2.Rodrigues(R1)
+        rvec_r, _ = cv2.Rodrigues(R2)
+        points_3D_float32 = points_3D.astype(np.float32)
+        projPoints_l, _ = cv2.projectPoints(
+            points_3D_float32, rvec_l, t1, K, distCoeffs=np.array([])
+        )
+        projPoints_r, _ = cv2.projectPoints(
+            points_3D_float32, rvec_r, t2, K, distCoeffs=np.array([])
+        )
+        proj_l = np.squeeze(projPoints_l).reshape(-1, 2)
+        proj_r = np.squeeze(projPoints_r).reshape(-1, 2)
+        kpts_i_xy = kpts_i.T
+        kpts_j_xy = kpts_j.T
+
+        # Camera centers
+        C1 = -R1.T @ t1
+        C2 = -R2.T @ t2
+
+        accepted_err_l = []
+        accepted_err_r = []
+
         for i in range(kpts_i.shape[1]):
+            X = points_3D[i].reshape(3, 1)
+            # Cheirality (positive depth)
+            z1 = (R1 @ X + t1)[2, 0]
+            z2 = (R2 @ X + t2)[2, 0]
+            if z1 <= tri_min_depth or z2 <= tri_min_depth:
+                continue
+
+            # Triangulation angle
+            v1 = (X - C1).reshape(3)
+            v2 = (X - C2).reshape(3)
+            denom = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-12
+            cosang = np.clip(np.dot(v1, v2) / denom, -1.0, 1.0)
+            ang = np.arccos(cosang)
+            if ang < tri_min_angle:
+                continue
+
+            # Reprojection error filter (L1)
+            err_l = np.abs(proj_l[i] - kpts_i_xy[i])
+            err_r = np.abs(proj_r[i] - kpts_j_xy[i])
+            if (
+                err_l.max() > tri_max_reproj
+                or err_r.max() > tri_max_reproj
+            ):
+                continue
+
             source_2dpt_idxs = {idx1: idxs_i[i], idx2: idxs_j[i]}
             pt = Point3DWithViews(points_3D[i], source_2dpt_idxs)
             points3d.append(pt)
+            if compute_reproj:
+                accepted_err_l.append(err_l.tolist())
+                accepted_err_r.append(err_r.tolist())
 
         if compute_reproj:
-            kpts_i = kpts_i.T
-            kpts_j = kpts_j.T
-            rvec_l, _ = cv2.Rodrigues(R1)
-            rvec_r, _ = cv2.Rodrigues(R2)
+            if not accepted_err_l:
+                return points3d, [], 0.0, 0.0
 
-            # Ensure points_3D is float32 and correct shape for projectPoints
-            points_3D_float32 = points_3D.astype(np.float32)
-
-            projPoints_l, _ = cv2.projectPoints(
-                points_3D_float32, rvec_l, t1, K, distCoeffs=np.array([])
-            )
-            projPoints_r, _ = cv2.projectPoints(
-                points_3D_float32, rvec_r, t2, K, distCoeffs=np.array([])
-            )
-
-            delta_l, delta_r = [], []
-            for i in range(len(projPoints_l)):
-                delta_l.append(abs(projPoints_l[i][0][0] - kpts_i[i][0]))
-                delta_l.append(abs(projPoints_l[i][0][1] - kpts_i[i][1]))
-                delta_r.append(abs(projPoints_r[i][0][0] - kpts_j[i][0]))
-                delta_r.append(abs(projPoints_r[i][0][1] - kpts_j[i][1]))
-
+            # Flatten per-point errors
+            delta_l = [e for pair in accepted_err_l for e in pair]
+            delta_r = [e for pair in accepted_err_r for e in pair]
             avg_error_l = sum(delta_l) / len(delta_l) if delta_l else 0.0
             avg_error_r = sum(delta_r) / len(delta_r) if delta_r else 0.0
 
@@ -432,6 +473,9 @@ class ReconstructionPipeline:
             print(
                 f"Warning: No filtered matches found for pair {resected_idx, unresected_idx} during PnP correspondence gathering. Returning empty lists."
             )
+            # Clear pending observations for safety
+            self._pending_pnp_observations = []
+            self._pending_pnp_unresected_idx = None
             return pts3d, [], [], np.array([])  # Return empty lists if no matches
 
         current_matches_list = matches[match_key]
@@ -441,6 +485,9 @@ class ReconstructionPipeline:
 
         pts3d_for_pnp = []
         pts2d_for_pnp = []
+        # Aligned list with pts3d_for_pnp/pts2d_for_pnp. Each entry is either
+        # (Point3DWithViews, unresected_kpt_idx) or None if already tracked.
+        pnp_observations = []
 
         for pt3d in pts3d:
             # Check if this 3D point is seen by the resected image
@@ -463,12 +510,13 @@ class ReconstructionPipeline:
                         # Check if this match refers to the resected keypoint from the 3D point
                         # and that the corresponding train keypoint in match is what we need for unresected
 
-                        # Add new 2d/3d correspondences to 3D point object
-                        # Only add if it's not already there
+                        # Defer mutation until PnP is accepted
                         if unresected_idx not in pt3d.source_2dpt_idxs:
-                            pt3d.source_2dpt_idxs[unresected_idx] = (
-                                unresected_kpt_idx_in_match
+                            pnp_observations.append(
+                                (pt3d, unresected_kpt_idx_in_match)
                             )
+                        else:
+                            pnp_observations.append(None)
 
                         pts3d_for_pnp.append(pt3d.point3d)
                         pts2d_for_pnp.append(
@@ -487,9 +535,11 @@ class ReconstructionPipeline:
                         unresected_kpt_idx_in_match = match.queryIdx
 
                         if unresected_idx not in pt3d.source_2dpt_idxs:
-                            pt3d.source_2dpt_idxs[unresected_idx] = (
-                                unresected_kpt_idx_in_match
+                            pnp_observations.append(
+                                (pt3d, unresected_kpt_idx_in_match)
                             )
+                        else:
+                            pnp_observations.append(None)
 
                         pts3d_for_pnp.append(pt3d.point3d)
                         pts2d_for_pnp.append(
@@ -500,6 +550,10 @@ class ReconstructionPipeline:
                         )
                         found_match_for_pnp = True
                         break  # Move to next 3D point
+
+        # Store pending observations to apply only if PnP is accepted
+        self._pending_pnp_observations = pnp_observations
+        self._pending_pnp_unresected_idx = unresected_idx
 
         return pts3d, pts3d_for_pnp, pts2d_for_pnp, triangulation_status
 
@@ -590,10 +644,68 @@ class ReconstructionPipeline:
             return None, None
 
         if success and rvec is not None and tvec is not None:
+            # Gate PnP by inlier ratio and reprojection error to avoid corrupting the model
+            min_inlier_ratio = float(os.getenv("PNP_MIN_INLIER_RATIO", "0.5"))
+            min_inlier_count = int(os.getenv("PNP_MIN_INLIER_COUNT", "50"))
+            max_reproj_err = float(os.getenv("PNP_MAX_REPROJ_ERR", "8.0"))
+
+            inlier_count = len(inliers) if inliers is not None else 0
+            total_count = len(object_points)
+            inlier_ratio = (inlier_count / total_count) if total_count > 0 else 0.0
+
+            # Compute mean absolute reprojection error (prefer inliers if available)
+            if inliers is not None and len(inliers) > 0:
+                inlier_idx = inliers.flatten()
+                obj_eval = object_points[inlier_idx]
+                img_eval = image_points[inlier_idx]
+            else:
+                obj_eval = object_points
+                img_eval = image_points
+
+            projpts_raw, _ = cv2.projectPoints(
+                obj_eval, rvec, tvec, K, distCoeffs=np.array([])
+            )
+            projpts = np.squeeze(projpts_raw).reshape(-1, 2)
+            imgpts = img_eval.reshape(-1, 2)
+            reproj_err = (
+                float(np.mean(np.abs(projpts - imgpts)))
+                if len(imgpts)
+                else float("inf")
+            )
+
+            if (
+                inlier_ratio < min_inlier_ratio
+                or inlier_count < min_inlier_count
+                or reproj_err > max_reproj_err
+            ):
+                print(
+                    f"PnP rejected: inliers {inlier_count}/{total_count} ({inlier_ratio*100:.2f}%), reproj_err {reproj_err:.2f}px"
+                )
+                self._pending_pnp_observations = []
+                self._pending_pnp_unresected_idx = None
+                return None, None
+
             R, _ = cv2.Rodrigues(rvec)
             print(
                 f"solvePnPRansac successful. Inliers: {len(inliers) if inliers is not None else 'N/A'}/{len(object_points)}"
             )
+            # Commit pending observations only after PnP is accepted
+            unres_idx = getattr(self, "_pending_pnp_unresected_idx", None)
+            pending_obs = getattr(self, "_pending_pnp_observations", [])
+            if unres_idx is not None and pending_obs:
+                if inliers is not None and len(inliers) > 0:
+                    inlier_set = set(inliers.flatten().tolist())
+                else:
+                    inlier_set = set(range(len(pending_obs)))
+
+                for idx, obs in enumerate(pending_obs):
+                    if idx not in inlier_set or obs is None:
+                        continue
+                    pt3d_obj, kpt_idx = obs
+                    if unres_idx not in pt3d_obj.source_2dpt_idxs:
+                        pt3d_obj.source_2dpt_idxs[unres_idx] = kpt_idx
+            self._pending_pnp_observations = []
+            self._pending_pnp_unresected_idx = None
             return R, tvec
         else:
             print("solvePnPRansac failed.")
@@ -603,6 +715,8 @@ class ReconstructionPipeline:
                 print("  - rvec was None.")
             if tvec is None:
                 print("  - tvec was None.")
+            self._pending_pnp_observations = []
+            self._pending_pnp_unresected_idx = None
             return None, None
 
     def prep_for_reproj(self, img_idx, points3d_with_views, keypoints):
