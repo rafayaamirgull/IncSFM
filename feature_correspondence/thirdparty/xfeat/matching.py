@@ -39,6 +39,9 @@ class XFeatMatcher:
         self.weights_path = weights_path
 
         self.input_scale = input_scale
+        self.batch_size = max(1, int(os.getenv("XFEAT_BATCH_SIZE", "8")))
+        amp_env = os.getenv("XFEAT_USE_AMP", "1")
+        self.use_amp = amp_env == "1"
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,6 +55,8 @@ class XFeatMatcher:
 
         self.xfeat = self._load_xfeat_model()
         self._configure_model_device()
+        if self.device.type != "cuda":
+            self.use_amp = False
 
     def _resolve_local_repo(self) -> Optional[str]:
         if self.local_repo_path:
@@ -163,74 +168,166 @@ class XFeatMatcher:
 
         return img_f
 
+    def _run_detect_and_compute(self, image_input):
+        if self.use_amp and self.device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                try:
+                    return self.xfeat.detectAndCompute(
+                        image_input,
+                        top_k=self.top_k,
+                        detection_threshold=self.detection_threshold,
+                    )
+                except TypeError:
+                    return self.xfeat.detectAndCompute(
+                        image_input,
+                        top_k=self.top_k,
+                    )
+
+        try:
+            return self.xfeat.detectAndCompute(
+                image_input,
+                top_k=self.top_k,
+                detection_threshold=self.detection_threshold,
+            )
+        except TypeError:
+            return self.xfeat.detectAndCompute(
+                image_input,
+                top_k=self.top_k,
+            )
+
+    def _parse_model_output(
+        self, out_obj
+    ) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
+        if isinstance(out_obj, list):
+            if not out_obj:
+                return [], np.empty((0, 64), dtype=np.float32)
+            out_obj = out_obj[0]
+
+        kpts_np = self._normalize_keypoints_output(out_obj["keypoints"])
+        desc_np = self._normalize_descriptors_output(out_obj["descriptors"])
+
+        if kpts_np.size == 0:
+            keypoints = []
+        else:
+            keypoints = [
+                cv2.KeyPoint(float(x), float(y), 1)
+                for x, y in kpts_np.reshape(-1, 2)
+            ]
+
+        return keypoints, desc_np.astype(np.float32, copy=False)
+
+    def _extract_single_image(
+        self, image: np.ndarray
+    ) -> Tuple[List[cv2.KeyPoint], np.ndarray]:
+        image_prepped = self._prepare_image(image)
+        out = self._run_detect_and_compute(image_prepped)
+        return self._parse_model_output(out)
+
     @torch.inference_mode()
     def extract_xfeat_features(
         self, images: List[np.ndarray]
     ) -> Tuple[List[List[cv2.KeyPoint]], List[np.ndarray]]:
         print("\n--- Extracting XFeat Features ---")
-        all_keypoints: List[List[cv2.KeyPoint]] = []
-        all_descriptors: List[np.ndarray] = []
+        n_images = len(images)
+        all_keypoints: List[List[cv2.KeyPoint]] = [[] for _ in range(n_images)]
+        all_descriptors: List[np.ndarray] = [
+            np.empty((0, 64), dtype=np.float32) for _ in range(n_images)
+        ]
 
-        for i, img in enumerate(images):
-            img = self._prepare_image(img)
-            try:
-                out = self.xfeat.detectAndCompute(
-                    img,
-                    top_k=self.top_k,
-                    detection_threshold=self.detection_threshold,
-                )
-            except TypeError:
-                out = self.xfeat.detectAndCompute(img, top_k=self.top_k)
+        if self.batch_size <= 1:
+            for i, img in enumerate(images):
+                keypoints, descriptors = self._extract_single_image(img)
+                all_keypoints[i] = keypoints
+                all_descriptors[i] = descriptors
+                print(f"  Extracted {len(keypoints)} XFeat features from image #{i}")
+            return all_keypoints, all_descriptors
 
-            if isinstance(out, list):
-                if not out:
-                    kpts_np = np.empty((0, 2), dtype=np.float32)
-                    desc_np = np.empty((0, 64), dtype=np.float32)
-                else:
-                    out = out[0]
-                    kpts_np = self._normalize_keypoints_output(out["keypoints"])
-                    desc_np = self._normalize_descriptors_output(out["descriptors"])
-            else:
-                kpts_np = self._normalize_keypoints_output(out["keypoints"])
-                desc_np = self._normalize_descriptors_output(out["descriptors"])
+        prepared_images: List[np.ndarray] = [self._prepare_image(img) for img in images]
+        buckets: Dict[Tuple[int, ...], List[int]] = {}
+        fallback_indices: List[int] = []
 
-            if kpts_np.size == 0:
-                keypoints = []
-            else:
-                keypoints = [
-                    cv2.KeyPoint(float(x), float(y), 1)
-                    for x, y in kpts_np.reshape(-1, 2)
-                ]
+        for idx, img in enumerate(prepared_images):
+            if not isinstance(img, np.ndarray):
+                fallback_indices.append(idx)
+                continue
+            buckets.setdefault(tuple(img.shape), []).append(idx)
 
-            desc_np = desc_np.astype(np.float32, copy=False)
-            all_keypoints.append(keypoints)
-            all_descriptors.append(desc_np)
-            print(f"  Extracted {len(keypoints)} XFeat features from image #{i}")
+        for idx in fallback_indices:
+            keypoints, descriptors = self._extract_single_image(prepared_images[idx])
+            all_keypoints[idx] = keypoints
+            all_descriptors[idx] = descriptors
+
+        for _, indices in buckets.items():
+            for start in range(0, len(indices), self.batch_size):
+                chunk = indices[start : start + self.batch_size]
+                chunk_imgs = [prepared_images[i] for i in chunk]
+
+                try:
+                    stacked = np.stack(chunk_imgs, axis=0)
+                    batch_tensor = torch.from_numpy(stacked)
+                    if batch_tensor.dim() == 3:
+                        batch_tensor = batch_tensor.unsqueeze(1)
+                    elif batch_tensor.dim() == 4:
+                        batch_tensor = batch_tensor.permute(0, 3, 1, 2)
+                    else:
+                        raise ValueError(
+                            f"Unsupported batch tensor shape: {tuple(batch_tensor.shape)}"
+                        )
+                    batch_tensor = batch_tensor.float()
+                    out_batch = self._run_detect_and_compute(batch_tensor)
+                    if not isinstance(out_batch, list) or len(out_batch) != len(chunk):
+                        raise RuntimeError(
+                            "Unexpected batched output from XFeat detectAndCompute."
+                        )
+
+                    for local_idx, out_obj in enumerate(out_batch):
+                        keypoints, descriptors = self._parse_model_output(out_obj)
+                        image_idx = chunk[local_idx]
+                        all_keypoints[image_idx] = keypoints
+                        all_descriptors[image_idx] = descriptors
+                except Exception as exc:
+                    print(
+                        f"  XFeat batch extraction fallback on {len(chunk)} images ({exc})."
+                    )
+                    for image_idx in chunk:
+                        keypoints, descriptors = self._extract_single_image(
+                            prepared_images[image_idx]
+                        )
+                        all_keypoints[image_idx] = keypoints
+                        all_descriptors[image_idx] = descriptors
+
+        for i in range(n_images):
+            print(f"  Extracted {len(all_keypoints[i])} XFeat features from image #{i}")
 
         return all_keypoints, all_descriptors
 
     @torch.inference_mode()
-    def match_descriptors(
-        self, desc1: np.ndarray, desc2: np.ndarray
+    def _prepare_descriptor_tensor(self, desc: np.ndarray) -> Optional[torch.Tensor]:
+        if desc is None or desc.size == 0:
+            return None
+        t = torch.from_numpy(desc).to(self.device)
+        if t.dtype != torch.float32:
+            t = t.float()
+        t = F.normalize(t, dim=1)
+        if self.use_amp and self.device.type == "cuda":
+            t = t.half()
+        return t
+
+    @torch.inference_mode()
+    def _match_descriptor_tensors(
+        self, t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if desc1 is None or desc2 is None or desc1.size == 0 or desc2.size == 0:
+        if t1 is None or t2 is None or t1.numel() == 0 or t2.numel() == 0:
             return (
                 np.array([], dtype=np.int64),
                 np.array([], dtype=np.int64),
                 np.array([], dtype=np.float32),
             )
 
-        t1 = torch.from_numpy(desc1).to(self.device)
-        t2 = torch.from_numpy(desc2).to(self.device)
-        if t1.dtype != torch.float32:
-            t1 = t1.float()
-        if t2.dtype != torch.float32:
-            t2 = t2.float()
-
-        t1 = F.normalize(t1, dim=1)
-        t2 = F.normalize(t2, dim=1)
-
         sim = t1 @ t2.t()
+        if sim.dtype != torch.float32:
+            sim = sim.float()
+
         match12 = torch.argmax(sim, dim=1)
         match21 = torch.argmax(sim, dim=0)
 
@@ -253,50 +350,151 @@ class XFeatMatcher:
             scores.detach().cpu().numpy(),
         )
 
+    @torch.inference_mode()
+    def match_descriptors(
+        self, desc1: np.ndarray, desc2: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._match_descriptor_tensors(
+            self._prepare_descriptor_tensor(desc1),
+            self._prepare_descriptor_tensor(desc2),
+        )
+
+    def _build_candidate_pairs(
+        self,
+        image_descriptors: List[np.ndarray],
+        pair_window: int,
+        global_topk: int,
+        global_min_gap: int,
+        global_min_sim: float,
+    ) -> List[Tuple[int, int]]:
+        num_images = len(image_descriptors)
+        pair_set = set()
+
+        for i in range(num_images):
+            j_start = i + 1
+            j_end = (
+                num_images
+                if pair_window <= 0
+                else min(num_images, i + 1 + pair_window)
+            )
+            for j in range(j_start, j_end):
+                pair_set.add((i, j))
+
+        if global_topk <= 0 or num_images <= 1:
+            return sorted(pair_set)
+
+        desc_dim = None
+        for desc in image_descriptors:
+            if desc is not None and desc.size > 0:
+                desc_dim = desc.shape[1]
+                break
+        if desc_dim is None:
+            return sorted(pair_set)
+
+        global_desc = np.zeros((num_images, desc_dim), dtype=np.float32)
+        valid = np.zeros(num_images, dtype=bool)
+        for i, desc in enumerate(image_descriptors):
+            if desc is None or desc.size == 0:
+                continue
+            pooled = desc.mean(axis=0).astype(np.float32, copy=False)
+            norm = np.linalg.norm(pooled)
+            if norm <= 1e-8:
+                continue
+            global_desc[i] = pooled / norm
+            valid[i] = True
+
+        if valid.sum() <= 1:
+            return sorted(pair_set)
+
+        similarity = global_desc @ global_desc.T
+        np.fill_diagonal(similarity, -np.inf)
+        nonlocal_start_gap = max(global_min_gap, pair_window + 1)
+
+        for i in range(num_images):
+            if not valid[i]:
+                continue
+            row = similarity[i].copy()
+            if nonlocal_start_gap > 0:
+                left = max(0, i - nonlocal_start_gap + 1)
+                right = min(num_images, i + nonlocal_start_gap)
+                row[left:right] = -np.inf
+
+            ranked = np.argsort(-row)
+            added = 0
+            for j in ranked:
+                score = float(row[j])
+                if not np.isfinite(score):
+                    break
+                if score < global_min_sim:
+                    break
+                pair_set.add((min(i, int(j)), max(i, int(j))))
+                added += 1
+                if added >= global_topk:
+                    break
+
+        return sorted(pair_set)
+
     def find_raw_matches(
         self, image_descriptors: List[np.ndarray]
     ) -> Dict[Tuple[int, int], List[cv2.DMatch]]:
         print("\n--- Performing XFeat Matching ---")
-        num_images = len(image_descriptors)
         raw_matches_map: Dict[Tuple[int, int], List[cv2.DMatch]] = {}
         pair_window_env = os.getenv("XFEAT_PAIR_WINDOW") or os.getenv("PAIR_WINDOW")
         max_matches_env = os.getenv("XFEAT_MAX_MATCHES_PER_PAIR")
+        global_topk_env = os.getenv("XFEAT_GLOBAL_TOPK")
+        global_min_gap_env = os.getenv("XFEAT_GLOBAL_MIN_GAP")
+        global_min_sim_env = os.getenv("XFEAT_GLOBAL_MIN_SIM")
         pair_window = int(pair_window_env) if pair_window_env else 0
         max_matches = int(max_matches_env) if max_matches_env else 0
+        global_topk = int(global_topk_env) if global_topk_env else 0
+        global_min_gap = int(global_min_gap_env) if global_min_gap_env else 0
+        global_min_sim = float(global_min_sim_env) if global_min_sim_env else 0.15
 
-        for i in range(num_images):
-            j_start = i + 1
-            j_end = num_images if pair_window <= 0 else min(num_images, i + 1 + pair_window)
-            for j in range(j_start, j_end):
-                desc1 = image_descriptors[i]
-                desc2 = image_descriptors[j]
-                if desc1.size == 0 or desc2.size == 0:
-                    print(
-                        f"  Skipping match between image #{i} and #{j}: one or both have no descriptors."
-                    )
-                    continue
+        candidate_pairs = self._build_candidate_pairs(
+            image_descriptors=image_descriptors,
+            pair_window=pair_window,
+            global_topk=global_topk,
+            global_min_gap=global_min_gap,
+            global_min_sim=global_min_sim,
+        )
+        print(f"  Candidate pairs for matching: {len(candidate_pairs)}")
 
-                idxs0, idxs1, scores = self.match_descriptors(desc1, desc2)
-                if max_matches > 0 and len(scores) > max_matches:
-                    top_idx = np.argsort(-scores)[:max_matches]
-                    idxs0 = idxs0[top_idx]
-                    idxs1 = idxs1[top_idx]
-                    scores = scores[top_idx]
-                matches = []
-                for k in range(len(idxs0)):
-                    distance = float(1.0 - scores[k])
-                    matches.append(
-                        cv2.DMatch(
-                            _queryIdx=int(idxs0[k]),
-                            _trainIdx=int(idxs1[k]),
-                            _distance=distance,
-                        )
-                    )
+        desc_tensors = [
+            self._prepare_descriptor_tensor(desc) for desc in image_descriptors
+        ]
 
-                raw_matches_map[(i, j)] = matches
+        for i, j in candidate_pairs:
+            desc1 = image_descriptors[i]
+            desc2 = image_descriptors[j]
+            if desc1.size == 0 or desc2.size == 0:
                 print(
-                    f"  Image #{i} and Image #{j}: {len(matches)} raw matches (MNN)"
+                    f"  Skipping match between image #{i} and #{j}: one or both have no descriptors."
                 )
+                continue
+
+            idxs0, idxs1, scores = self._match_descriptor_tensors(
+                desc_tensors[i], desc_tensors[j]
+            )
+            if max_matches > 0 and len(scores) > max_matches:
+                top_idx = np.argsort(-scores)[:max_matches]
+                idxs0 = idxs0[top_idx]
+                idxs1 = idxs1[top_idx]
+                scores = scores[top_idx]
+            matches = []
+            for k in range(len(idxs0)):
+                distance = float(1.0 - scores[k])
+                matches.append(
+                    cv2.DMatch(
+                        _queryIdx=int(idxs0[k]),
+                        _trainIdx=int(idxs1[k]),
+                        _distance=distance,
+                    )
+                )
+
+            raw_matches_map[(i, j)] = matches
+            print(
+                f"  Image #{i} and Image #{j}: {len(matches)} raw matches (MNN)"
+            )
 
         return raw_matches_map
 

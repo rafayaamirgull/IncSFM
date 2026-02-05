@@ -255,6 +255,124 @@ def rotation_matrix_to_quaternion(R):
     return qw, qx, qy, qz
 
 
+def _sample_bgr_bilinear(image: np.ndarray, x: float, y: float) -> Optional[np.ndarray]:
+    """
+    Bilinear sample in BGR image coordinates. Returns uint8 BGR vector or None if out of bounds.
+    """
+    if image is None or image.ndim != 3:
+        return None
+    h, w = image.shape[:2]
+    if x < 0.0 or y < 0.0 or x > (w - 1) or y > (h - 1):
+        return None
+
+    x0 = int(np.floor(x))
+    y0 = int(np.floor(y))
+    x1 = min(x0 + 1, w - 1)
+    y1 = min(y0 + 1, h - 1)
+
+    wx = x - x0
+    wy = y - y0
+
+    c00 = image[y0, x0].astype(np.float32)
+    c10 = image[y0, x1].astype(np.float32)
+    c01 = image[y1, x0].astype(np.float32)
+    c11 = image[y1, x1].astype(np.float32)
+
+    sampled = (
+        (1.0 - wx) * (1.0 - wy) * c00
+        + wx * (1.0 - wy) * c10
+        + (1.0 - wx) * wy * c01
+        + wx * wy * c11
+    )
+    return np.clip(np.round(sampled), 0, 255).astype(np.uint8)
+
+
+def _compute_point_color_bgr(
+    pt_obj: Point3DWithViews,
+    loaded_images: List[np.ndarray],
+    all_keypoints: List[List[cv2.KeyPoint]],
+    reconstructed_R_mats: Dict[int, np.ndarray],
+    image_height: int,
+    image_width: int,
+    point_color_strategy: str,
+) -> Optional[np.ndarray]:
+    """
+    Compute one BGR color for a 3D point from all its valid 2D observations.
+    """
+    point_colors_bgr_list = []
+    sorted_observing_py_img_indices = sorted(pt_obj.source_2dpt_idxs.keys())
+
+    for img_py_idx in sorted_observing_py_img_indices:
+        if img_py_idx not in reconstructed_R_mats:
+            continue
+        kpt_original_idx = pt_obj.source_2dpt_idxs[img_py_idx]
+
+        if not (0 <= img_py_idx < len(loaded_images)):
+            continue
+        if not (0 <= kpt_original_idx < len(all_keypoints[img_py_idx])):
+            continue
+
+        kp = all_keypoints[img_py_idx][kpt_original_idx]
+        kp_x, kp_y = kp.pt
+        if not (0.0 <= kp_y < image_height and 0.0 <= kp_x < image_width):
+            continue
+
+        bgr_pixel = _sample_bgr_bilinear(loaded_images[img_py_idx], kp_x, kp_y)
+        if bgr_pixel is not None:
+            point_colors_bgr_list.append(bgr_pixel)
+
+    if not point_colors_bgr_list:
+        return None
+
+    stacked = np.stack(point_colors_bgr_list, axis=0).astype(np.float32)
+    if point_color_strategy == "first":
+        return stacked[0].astype(np.uint8)
+    if point_color_strategy == "median":
+        return np.clip(np.round(np.median(stacked, axis=0)), 0, 255).astype(np.uint8)
+
+    # Default to average for robustness/noise smoothing.
+    return np.clip(np.round(np.mean(stacked, axis=0)), 0, 255).astype(np.uint8)
+
+
+def compute_point_colors_for_visualization(
+    reconstructed_points3d_with_views: List[Point3DWithViews],
+    loaded_images: List[np.ndarray],
+    all_keypoints: List[List[cv2.KeyPoint]],
+    reconstructed_R_mats: Dict[int, np.ndarray],
+    image_height: int,
+    image_width: int,
+    point_color_strategy: str = "average",
+) -> np.ndarray:
+    """
+    Computes per-point RGB colors (0-1) for all reconstructed points in list order.
+    """
+    valid_color_strategies = ["first", "average", "median"]
+    if point_color_strategy not in valid_color_strategies:
+        raise ValueError(
+            f"Invalid point_color_strategy. Choose from {valid_color_strategies}"
+        )
+
+    colors_rgb = []
+    default_rgb = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+    for pt_obj in reconstructed_points3d_with_views:
+        bgr = _compute_point_color_bgr(
+            pt_obj=pt_obj,
+            loaded_images=loaded_images,
+            all_keypoints=all_keypoints,
+            reconstructed_R_mats=reconstructed_R_mats,
+            image_height=image_height,
+            image_width=image_width,
+            point_color_strategy=point_color_strategy,
+        )
+        if bgr is None:
+            colors_rgb.append(default_rgb)
+        else:
+            # Convert BGR [0,255] -> RGB [0,1]
+            colors_rgb.append(np.array([bgr[2], bgr[1], bgr[0]], dtype=np.float32) / 255.0)
+
+    return np.asarray(colors_rgb, dtype=np.float32)
+
+
 def export_to_colmap(
     output_path: str,
     K_matrix: np.matrix,
@@ -311,52 +429,17 @@ def export_to_colmap(
         x_3d, y_3d, z_3d = pt_obj.point3d.ravel()
 
         r_val, g_val, b_val = 0, 0, 0  # Default color
-        point_colors_bgr_list = []  # Store as list of (B,G,R) tuples
-
-        sorted_observing_py_img_indices = sorted(pt_obj.source_2dpt_idxs.keys())
-
-        for img_py_idx in sorted_observing_py_img_indices:
-            if img_py_idx in reconstructed_R_mats:
-                kpt_original_idx = pt_obj.source_2dpt_idxs[img_py_idx]
-
-                if 0 <= img_py_idx < len(loaded_images) and 0 <= kpt_original_idx < len(
-                    all_keypoints[img_py_idx]
-                ):
-
-                    kp = all_keypoints[img_py_idx][kpt_original_idx]
-                    kp_x, kp_y = kp.pt
-                    iy = int(round(kp_y))
-                    ix = int(round(kp_x))
-
-                    if 0 <= iy < image_height and 0 <= ix < image_width:
-                        bgr_pixel = loaded_images[img_py_idx][iy, ix]
-                        point_colors_bgr_list.append(bgr_pixel)  # Store as (B, G, R)
-
-        if point_colors_bgr_list:
-            if point_color_strategy == "first":
-                # Use the color from the first valid observation
-                b_val, g_val, r_val = point_colors_bgr_list[0]
-
-            elif point_color_strategy == "average":
-                # Average colors (convert to float for mean, then back to int)
-                avg_b = int(round(np.mean([c[0] for c in point_colors_bgr_list])))
-                avg_g = int(round(np.mean([c[1] for c in point_colors_bgr_list])))
-                avg_r = int(round(np.mean([c[2] for c in point_colors_bgr_list])))
-                b_val, g_val, r_val = avg_b, avg_g, avg_r
-
-            elif point_color_strategy == "median":
-                # Median colors (more robust to outliers)
-                # np.median operates on flattened arrays or per-axis
-                # For RGB, it's common to take median per channel
-                median_b = int(round(np.median([c[0] for c in point_colors_bgr_list])))
-                median_g = int(round(np.median([c[1] for c in point_colors_bgr_list])))
-                median_r = int(round(np.median([c[2] for c in point_colors_bgr_list])))
-                b_val, g_val, r_val = median_b, median_g, median_r
-
-            # Ensure values are within 0-255 (though rounding from mean/median should be okay)
-            r_val = np.clip(r_val, 0, 255)
-            g_val = np.clip(g_val, 0, 255)
-            b_val = np.clip(b_val, 0, 255)
+        bgr = _compute_point_color_bgr(
+            pt_obj=pt_obj,
+            loaded_images=loaded_images,
+            all_keypoints=all_keypoints,
+            reconstructed_R_mats=reconstructed_R_mats,
+            image_height=image_height,
+            image_width=image_width,
+            point_color_strategy=point_color_strategy,
+        )
+        if bgr is not None:
+            b_val, g_val, r_val = int(bgr[0]), int(bgr[1]), int(bgr[2])
 
         # Note: COLMAP expects R G B order
         final_r, final_g, final_b = r_val, g_val, b_val

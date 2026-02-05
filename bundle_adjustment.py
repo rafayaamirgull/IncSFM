@@ -504,6 +504,14 @@ def do_BA_pytorch(
             min_track_length = 2
     if device_override is None:
         device_override = os.getenv("BA_DEVICE")
+    optimize_intrinsics = os.getenv("BA_OPTIMIZE_INTRINSICS", "0") == "1"
+    optimize_intrinsics_min_cams = int(
+        os.getenv("BA_OPTIMIZE_INTRINSICS_MIN_CAMS", "12")
+    )
+    intrinsics_reg = float(os.getenv("BA_INTRINSICS_REG", "1e-2"))
+    prune_outliers = os.getenv("BA_PRUNE_OUTLIERS", "1") == "1"
+    outlier_thresh = float(os.getenv("BA_OUTLIER_THRESH", "4.0"))
+    min_track_after_prune = int(os.getenv("BA_MIN_TRACK_AFTER_PRUNE", "2"))
 
     print(f"Starting PyTorch BA for {len(resected_imgs_orig_indices)} cameras.")
 
@@ -574,7 +582,10 @@ def do_BA_pytorch(
     current_optim_pt_idx = 0
 
     obs_cam_optim_indices = []
+    obs_cam_orig_indices = []
     obs_pt_optim_indices = []
+    obs_pt_orig_indices = []
+    obs_kpt_indices = []
     obs_points_2d_list = []
     initial_points_3d_optim_list = []
 
@@ -602,7 +613,10 @@ def do_BA_pytorch(
         for cam_orig_idx_viewing_pt in active_views:
             kpt_idx_in_cam = pt3d_obj.source_2dpt_idxs[cam_orig_idx_viewing_pt]
             obs_cam_optim_indices.append(cam_orig_to_optim_idx[cam_orig_idx_viewing_pt])
+            obs_cam_orig_indices.append(cam_orig_idx_viewing_pt)
             obs_pt_optim_indices.append(current_optim_pt_idx)
+            obs_pt_orig_indices.append(i_orig_list_idx)
+            obs_kpt_indices.append(kpt_idx_in_cam)
             obs_points_2d_list.append(
                 all_keypoints[cam_orig_idx_viewing_pt][kpt_idx_in_cam].pt
             )
@@ -648,8 +662,24 @@ def do_BA_pytorch(
         K_np, dtype=torch.float32, device=device
     )  # K_np should be float
 
-    # Optimizer
-    optimizer = optim.Adam([params_tensor], lr=learning_rate)
+    intrinsics_optim = optimize_intrinsics and n_cameras_optim >= optimize_intrinsics_min_cams
+    if intrinsics_optim:
+        fx0 = float(K_np[0, 0])
+        fy0 = float(K_np[1, 1])
+        cx0 = float(K_np[0, 2])
+        cy0 = float(K_np[1, 2])
+        intrinsics_ref = torch.tensor(
+            [np.log(max(fx0, 1e-6)), np.log(max(fy0, 1e-6)), cx0, cy0],
+            dtype=torch.float32,
+            device=device,
+        )
+        intrinsics_params = intrinsics_ref.clone().detach().requires_grad_(True)
+        optimizer = optim.Adam([params_tensor, intrinsics_params], lr=learning_rate)
+        print("BA: optimizing intrinsics (fx, fy, cx, cy).")
+    else:
+        intrinsics_ref = None
+        intrinsics_params = None
+        optimizer = optim.Adam([params_tensor], lr=learning_rate)
 
     print(
         f"Optimizing {n_cameras_optim} cameras, {n_points_optim} points, {len(obs_points_2d_list)} observations."
@@ -661,6 +691,20 @@ def do_BA_pytorch(
 
     for i in range(n_iterations):
         optimizer.zero_grad(set_to_none=True)
+        if intrinsics_optim:
+            fx = torch.exp(intrinsics_params[0])
+            fy = torch.exp(intrinsics_params[1])
+            cx = intrinsics_params[2]
+            cy = intrinsics_params[3]
+            K_current = torch.zeros((3, 3), dtype=torch.float32, device=device)
+            K_current[0, 0] = fx
+            K_current[1, 1] = fy
+            K_current[0, 2] = cx
+            K_current[1, 2] = cy
+            K_current[2, 2] = 1.0
+        else:
+            K_current = K_tensor
+
         reprojection_errors = calculate_reprojection_error_torch(
             params_tensor,
             n_cameras_optim,
@@ -668,7 +712,7 @@ def do_BA_pytorch(
             cam_indices_tensor,
             pt_indices_tensor,
             pts_2d_tensor,
-            K_tensor,
+            K_current,
         )
 
         if loss_type == "huber":
@@ -678,6 +722,9 @@ def do_BA_pytorch(
             loss = (0.5 * quadratic.pow(2) + huber_delta * linear).sum()
         else:
             loss = reprojection_errors.pow(2).sum()  # Sum of squared errors
+
+        if intrinsics_optim and intrinsics_reg > 0.0:
+            loss = loss + intrinsics_reg * (intrinsics_params - intrinsics_ref).pow(2).sum()
 
         loss.backward()
         optimizer.step()
@@ -735,10 +782,74 @@ def do_BA_pytorch(
 
         t_vecs[orig_idx] = adj_cam_params_optim[optim_idx][9:].reshape(3, 1)
 
+    if intrinsics_optim:
+        with torch.no_grad():
+            fx = float(torch.exp(intrinsics_params[0]).item())
+            fy = float(torch.exp(intrinsics_params[1]).item())
+            cx = float(intrinsics_params[2].item())
+            cy = float(intrinsics_params[3].item())
+        K_np[:, :] = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32
+        )
+        print(
+            f"BA intrinsics updated: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}"
+        )
+
     # Update points3d_with_views
     for optim_pt_idx, i_orig_list_idx in optim_idx_to_pt3d_orig_list_idx.items():
         points3d_with_views[i_orig_list_idx].point3d = adj_pts_3d_optim[
             optim_pt_idx
         ].reshape(1, 3)
+
+    # Optional aggressive pruning of high-residual observations/tracks.
+    if prune_outliers and len(obs_points_2d_list) > 0:
+        with torch.no_grad():
+            if intrinsics_optim:
+                fx = torch.exp(intrinsics_params[0])
+                fy = torch.exp(intrinsics_params[1])
+                cx = intrinsics_params[2]
+                cy = intrinsics_params[3]
+                K_eval = torch.zeros((3, 3), dtype=torch.float32, device=device)
+                K_eval[0, 0] = fx
+                K_eval[1, 1] = fy
+                K_eval[0, 2] = cx
+                K_eval[1, 2] = cy
+                K_eval[2, 2] = 1.0
+            else:
+                K_eval = K_tensor
+
+            final_err = calculate_reprojection_error_torch(
+                params_tensor.detach(),
+                n_cameras_optim,
+                n_points_optim,
+                cam_indices_tensor,
+                pt_indices_tensor,
+                pts_2d_tensor,
+                K_eval,
+            )
+            final_err = final_err.abs().reshape(-1, 2).max(dim=1).values.cpu().numpy()
+
+        removed_obs = 0
+        for obs_idx, obs_err in enumerate(final_err):
+            if obs_err <= outlier_thresh:
+                continue
+            pt_orig_idx = obs_pt_orig_indices[obs_idx]
+            cam_orig_idx = obs_cam_orig_indices[obs_idx]
+            if pt_orig_idx >= len(points3d_with_views):
+                continue
+            pt_obj = points3d_with_views[pt_orig_idx]
+            if cam_orig_idx in pt_obj.source_2dpt_idxs:
+                del pt_obj.source_2dpt_idxs[cam_orig_idx]
+                removed_obs += 1
+
+        if removed_obs > 0:
+            before_pts = len(points3d_with_views)
+            points3d_with_views = [
+                p for p in points3d_with_views if len(p.source_2dpt_idxs) >= min_track_after_prune
+            ]
+            removed_pts = before_pts - len(points3d_with_views)
+            print(
+                f"BA pruning: removed {removed_obs} observations and {removed_pts} weak 3D points."
+            )
 
     return points3d_with_views, R_mats, t_vecs

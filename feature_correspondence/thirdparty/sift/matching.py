@@ -64,6 +64,81 @@ class FeatureMatcher:
             image_features.append((keypoints, descriptors))
         return image_features
 
+    def _build_candidate_pairs(
+        self,
+        image_descriptors: List[np.ndarray],
+        pair_window: int,
+        global_topk: int,
+        global_min_gap: int,
+        global_min_sim: float,
+    ) -> List[Tuple[int, int]]:
+        num_images = len(image_descriptors)
+        pair_set = set()
+
+        for i in range(num_images):
+            j_start = i + 1
+            j_end = (
+                num_images
+                if pair_window <= 0
+                else min(num_images, i + 1 + pair_window)
+            )
+            for j in range(j_start, j_end):
+                pair_set.add((i, j))
+
+        if global_topk <= 0 or num_images <= 1:
+            return sorted(pair_set)
+
+        desc_dim = None
+        for desc in image_descriptors:
+            if desc is not None and desc.size > 0:
+                desc_dim = desc.shape[1]
+                break
+        if desc_dim is None:
+            return sorted(pair_set)
+
+        global_desc = np.zeros((num_images, desc_dim), dtype=np.float32)
+        valid = np.zeros(num_images, dtype=bool)
+        for i, desc in enumerate(image_descriptors):
+            if desc is None or desc.size == 0:
+                continue
+            pooled = desc.mean(axis=0).astype(np.float32, copy=False)
+            norm = np.linalg.norm(pooled)
+            if norm <= 1e-8:
+                continue
+            global_desc[i] = pooled / norm
+            valid[i] = True
+
+        if valid.sum() <= 1:
+            return sorted(pair_set)
+
+        similarity = global_desc @ global_desc.T
+        np.fill_diagonal(similarity, -np.inf)
+        nonlocal_start_gap = max(global_min_gap, pair_window + 1)
+
+        for i in range(num_images):
+            if not valid[i]:
+                continue
+            row = similarity[i].copy()
+            if nonlocal_start_gap > 0:
+                left = max(0, i - nonlocal_start_gap + 1)
+                right = min(num_images, i + nonlocal_start_gap)
+                row[left:right] = -np.inf
+
+            ranked = np.argsort(-row)
+            added = 0
+            for j in ranked:
+                score = float(row[j])
+                if not np.isfinite(score):
+                    break
+                if score < global_min_sim:
+                    break
+                pair_set.add((min(i, int(j)), max(i, int(j))))
+                added += 1
+                if added >= global_topk:
+                    break
+
+        return sorted(pair_set)
+
     def find_raw_matches(
         self, image_descriptors: List[np.ndarray]
     ) -> Dict[Tuple[int, int], List[cv2.DMatch]]:
@@ -83,43 +158,54 @@ class FeatureMatcher:
                                                       the raw, ratio-tested matches.
         """
         print("\n--- Performing Feature Matching ---")
-        num_images = len(image_descriptors)
         raw_matches_map: Dict[Tuple[int, int], List[cv2.DMatch]] = {}
 
         pair_window_env = os.getenv("SIFT_PAIR_WINDOW") or os.getenv("PAIR_WINDOW")
         max_matches_env = os.getenv("SIFT_MAX_MATCHES_PER_PAIR")
+        global_topk_env = os.getenv("SIFT_GLOBAL_TOPK")
+        global_min_gap_env = os.getenv("SIFT_GLOBAL_MIN_GAP")
+        global_min_sim_env = os.getenv("SIFT_GLOBAL_MIN_SIM")
         pair_window = int(pair_window_env) if pair_window_env else 0
         max_matches = int(max_matches_env) if max_matches_env else 0
+        global_topk = int(global_topk_env) if global_topk_env else 0
+        global_min_gap = int(global_min_gap_env) if global_min_gap_env else 0
+        global_min_sim = float(global_min_sim_env) if global_min_sim_env else 0.15
 
-        for i in range(num_images):
-            j_start = i + 1
-            j_end = num_images if pair_window <= 0 else min(num_images, i + 1 + pair_window)
-            for j in range(j_start, j_end):
-                desc1 = image_descriptors[i]
-                desc2 = image_descriptors[j]
-                # Skip if either image has no descriptors
-                if desc1.size == 0 or desc2.size == 0:
-                    print(
-                        f"  Skipping match between image #{i} and #{j}: one or both have no descriptors."
-                    )
-                    continue
+        candidate_pairs = self._build_candidate_pairs(
+            image_descriptors=image_descriptors,
+            pair_window=pair_window,
+            global_topk=global_topk,
+            global_min_gap=global_min_gap,
+            global_min_sim=global_min_sim,
+        )
+        print(f"  Candidate pairs for matching: {len(candidate_pairs)}")
 
-                # Perform k-NN matching
-                knn_matches = self.bf_matcher.knnMatch(desc1, desc2, k=2)
-
-                # Apply Lowe's ratio test
-                good_matches = []
-                for m, n in knn_matches:
-                    if m.distance < self.ratio_threshold * n.distance:
-                        good_matches.append(m)
-
-                if max_matches > 0 and len(good_matches) > max_matches:
-                    good_matches = sorted(good_matches, key=lambda m: m.distance)[:max_matches]
-
-                raw_matches_map[(i, j)] = good_matches
+        for i, j in candidate_pairs:
+            desc1 = image_descriptors[i]
+            desc2 = image_descriptors[j]
+            # Skip if either image has no descriptors
+            if desc1.size == 0 or desc2.size == 0:
                 print(
-                    f"  Image #{i} and Image #{j}: {len(good_matches)} raw matches (after ratio test)"
+                    f"  Skipping match between image #{i} and #{j}: one or both have no descriptors."
                 )
+                continue
+
+            # Perform k-NN matching
+            knn_matches = self.bf_matcher.knnMatch(desc1, desc2, k=2)
+
+            # Apply Lowe's ratio test
+            good_matches = []
+            for m, n in knn_matches:
+                if m.distance < self.ratio_threshold * n.distance:
+                    good_matches.append(m)
+
+            if max_matches > 0 and len(good_matches) > max_matches:
+                good_matches = sorted(good_matches, key=lambda m: m.distance)[:max_matches]
+
+            raw_matches_map[(i, j)] = good_matches
+            print(
+                f"  Image #{i} and Image #{j}: {len(good_matches)} raw matches (after ratio test)"
+            )
         return raw_matches_map
 
     def filter_matches_geometric_consistency(

@@ -614,24 +614,28 @@ class ReconstructionPipeline:
             return None, None
 
         try:
-            # cv2.solvePnPRansac(objectPoints, imagePoints, cameraMatrix, distCoeffs, rvec=None, tvec=None, useExtrinsicGuess=None, flags=None, rvec=None, tvec=None)
-            # The signature can be tricky. Use flags for method selection.
-            # reprojThresh is passed as `reprojError` argument for SOLVEPNP_RANSAC
-
-            # Using SOLVEPNP_P3P or SOLVEPNP_EPNP as more robust alternatives if SOLVEPNP_ITERATIVE fails,
-            # but SOLVEPNP_RANSAC is common. Sticking to solvePnPRansac for consistency with your code.
-
-            # Ensure distCoeffs is empty array if not used
+            # Ensure distCoeffs is empty array if not used.
             distCoeffs = np.array([])
+
+            solver_name = os.getenv("PNP_SOLVER", "EPNP").upper()
+            solver_map = {
+                "EPNP": cv2.SOLVEPNP_EPNP,
+                "AP3P": cv2.SOLVEPNP_AP3P,
+                "P3P": cv2.SOLVEPNP_P3P,
+                "ITERATIVE": cv2.SOLVEPNP_ITERATIVE,
+            }
+            pnp_flag = solver_map.get(solver_name, cv2.SOLVEPNP_EPNP)
+            pnp_confidence = float(os.getenv("PNP_CONFIDENCE", "0.999"))
 
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
                 object_points,
                 image_points,
                 K,
                 distCoeffs,
-                reprojectionError=reprojThresh,  # This is the correct parameter for RANSAC threshold
-                iterationsCount=iterations,  # Max iterations for RANSAC
-                flags=cv2.SOLVEPNP_P3P,  # Using P3P within RANSAC, or SOLVEPNP_EPNP
+                reprojectionError=reprojThresh,
+                iterationsCount=iterations,
+                confidence=pnp_confidence,
+                flags=pnp_flag,
             )
         except Exception as e:
             print(f"Error during cv2.solvePnPRansac call: {e}")
@@ -650,8 +654,34 @@ class ReconstructionPipeline:
             max_reproj_err = float(os.getenv("PNP_MAX_REPROJ_ERR", "8.0"))
 
             inlier_count = len(inliers) if inliers is not None else 0
+
+            # Refine accepted RANSAC pose on inliers for more stable BA initialization.
+            if inliers is not None and inlier_count >= min_pnp_points:
+                inlier_idx = inliers.flatten()
+                obj_refine = object_points[inlier_idx]
+                img_refine = image_points[inlier_idx]
+                try:
+                    refine_success, rvec_refined, tvec_refined = cv2.solvePnP(
+                        obj_refine,
+                        img_refine,
+                        K,
+                        distCoeffs,
+                        rvec,
+                        tvec,
+                        useExtrinsicGuess=True,
+                        flags=cv2.SOLVEPNP_ITERATIVE,
+                    )
+                    if refine_success:
+                        rvec, tvec = rvec_refined, tvec_refined
+                except Exception:
+                    pass
+
             total_count = len(object_points)
             inlier_ratio = (inlier_count / total_count) if total_count > 0 else 0.0
+            adaptive_min_inlier_count = min(
+                min_inlier_count,
+                max(min_pnp_points, int(np.ceil(0.5 * total_count))),
+            )
 
             # Compute mean absolute reprojection error (prefer inliers if available)
             if inliers is not None and len(inliers) > 0:
@@ -675,11 +705,11 @@ class ReconstructionPipeline:
 
             if (
                 inlier_ratio < min_inlier_ratio
-                or inlier_count < min_inlier_count
+                or inlier_count < adaptive_min_inlier_count
                 or reproj_err > max_reproj_err
             ):
                 print(
-                    f"PnP rejected: inliers {inlier_count}/{total_count} ({inlier_ratio*100:.2f}%), reproj_err {reproj_err:.2f}px"
+                    f"PnP rejected: inliers {inlier_count}/{total_count} ({inlier_ratio*100:.2f}%), required {adaptive_min_inlier_count}, reproj_err {reproj_err:.2f}px"
                 )
                 self._pending_pnp_observations = []
                 self._pending_pnp_unresected_idx = None
@@ -819,6 +849,8 @@ class ReconstructionPipeline:
         :param t_new: Translation vector of newly resected image
         :param rep_thresh: Number of pixels reprojected points must be within to qualify as inliers
         """
+        rep_thresh = float(os.getenv("PNP_TEST_REPROJ_THRESH", str(rep_thresh)))
+
         if not pts3d_for_pnp or not pts2d_for_pnp:
             return [], [], 0.0, 0.0  # Return empty if no points
 
