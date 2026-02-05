@@ -29,17 +29,19 @@ The final output includes the sparse 3D point cloud and the estimated camera pos
 
 Download and install Python 3.8 from [python.org](https://www.python.org/downloads/). Check "Add Python to PATH" during installation.
 
-### 2. Download the Project
+### 2. Clone the Project
 
 ```bash
-git clone https://github.com/yourusername/3d-reconstruction-tool.git
-cd 3d-reconstruction-tool
+git clone https://github.com/rafayaamirgull/IncSFM
+cd IncSFM
 ```
 
 ### 3. Install Requirements
 
+After activating your virtual environment or you can create your Docker container, run the following:
+
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## How to Use
