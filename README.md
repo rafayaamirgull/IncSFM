@@ -1,4 +1,4 @@
-# Panoptic 3D Scene Reconstruction from Photos 🏙️➡️🖥️
+# Panoptic 3D Scene Reconstruction from 2D Images 🏙️➡️🖥️
 
 ![](assets/gifs/unknown_object.gif)
 
