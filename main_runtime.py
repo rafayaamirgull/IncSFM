@@ -17,6 +17,18 @@ sys.modules["feature_correspondence.feature_correspondence"] = _fcr
 import main as _main
 
 
+def _get_images_runtime_guard(
+    base_path, dataset_path, img_format, use_n_imgs=-1, type_="color"
+):
+    """
+    Avoid loading the full color image set during feature extraction stage.
+    Color images are loaded later in _visualize_reconstruction_colored for export/visualization.
+    """
+    if type_ == "color" and os.getenv("LOAD_COLOR_EARLY", "0") != "1":
+        return []
+    return get_images(base_path, dataset_path, img_format, use_n_imgs, type_)
+
+
 def _visualize_reconstruction_colored(
     points_3d_with_views: list,
     R_mats: dict,
@@ -95,6 +107,8 @@ def _visualize_reconstruction_colored(
         _main.logging.info("SKIP_VIS=1: COLMAP export completed, skipping Open3D window.")
         return
 
+    point_cloud_voxel_size = float(os.getenv("POINT_CLOUD_VOXEL_SIZE", "0.0"))
+    _main.logging.info("Point cloud voxel size: %.6f", point_cloud_voxel_size)
     visualize_sfm_and_pose_open3d(
         points_3D=vpoints,
         camera_R_mats=R_mats,
@@ -104,15 +118,28 @@ def _visualize_reconstruction_colored(
         image_height=img_h,
         frustum_scale=0.3,
         point_colors=point_colors_viz,
+        point_voxel_size=point_cloud_voxel_size,
     )
     _main.logging.info("3D visualization complete.")
 
 
 _main.visualize_reconstruction = _visualize_reconstruction_colored
+_main.get_images = _get_images_runtime_guard
 
 # Default runtime profile: faster matching, cleaner BA, and better loop closures.
 os.environ.setdefault("XFEAT_USE_AMP", "1")
 os.environ.setdefault("XFEAT_BATCH_SIZE", "8")
+os.environ.setdefault("XFEAT_DYNAMIC_BATCH", "1")
+os.environ.setdefault("XFEAT_BATCH_SIZE_LARGE", "16")
+os.environ.setdefault("XFEAT_BATCH_SIZE_VERY_LARGE", "24")
+os.environ.setdefault("XFEAT_PARALLEL_MODE", "auto")
+os.environ.setdefault("XFEAT_PARALLEL_MIN_IMAGES", "60")
+os.environ.setdefault("XFEAT_PARALLEL_MIN_TOTAL_FEATURES", "180000")
+os.environ.setdefault("XFEAT_PARALLEL_MIN_PAIRS", "120")
+os.environ.setdefault("XFEAT_PARALLEL_MIN_PAIR_WORK", "8000000000")
+os.environ.setdefault("XFEAT_CUDA_STREAMS", "4")
+os.environ.setdefault("XFEAT_PAIR_CHUNK", "32")
+os.environ.setdefault("POINT_CLOUD_VOXEL_SIZE", "0.0")
 os.environ.setdefault("XFEAT_PAIR_WINDOW", "6")
 os.environ.setdefault("XFEAT_GLOBAL_TOPK", "4")
 os.environ.setdefault("XFEAT_GLOBAL_MIN_GAP", "8")

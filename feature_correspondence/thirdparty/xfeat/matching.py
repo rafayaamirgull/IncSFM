@@ -42,6 +42,25 @@ class XFeatMatcher:
         self.batch_size = max(1, int(os.getenv("XFEAT_BATCH_SIZE", "8")))
         amp_env = os.getenv("XFEAT_USE_AMP", "1")
         self.use_amp = amp_env == "1"
+        self.dynamic_batch = os.getenv("XFEAT_DYNAMIC_BATCH", "1") == "1"
+        self.batch_size_large = max(
+            self.batch_size, int(os.getenv("XFEAT_BATCH_SIZE_LARGE", "16"))
+        )
+        self.batch_size_very_large = max(
+            self.batch_size_large, int(os.getenv("XFEAT_BATCH_SIZE_VERY_LARGE", "24"))
+        )
+
+        self.parallel_mode = os.getenv("XFEAT_PARALLEL_MODE", "auto").lower()
+        self.parallel_min_images = int(os.getenv("XFEAT_PARALLEL_MIN_IMAGES", "60"))
+        self.parallel_min_total_features = int(
+            os.getenv("XFEAT_PARALLEL_MIN_TOTAL_FEATURES", "180000")
+        )
+        self.parallel_min_pairs = int(os.getenv("XFEAT_PARALLEL_MIN_PAIRS", "120"))
+        self.parallel_min_pair_work = int(
+            os.getenv("XFEAT_PARALLEL_MIN_PAIR_WORK", "8000000000")
+        )
+        self.cuda_streams = max(1, int(os.getenv("XFEAT_CUDA_STREAMS", "4")))
+        self.cuda_pair_chunk = max(1, int(os.getenv("XFEAT_PAIR_CHUNK", "32")))
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,6 +242,21 @@ class XFeatMatcher:
         out = self._run_detect_and_compute(image_prepped)
         return self._parse_model_output(out)
 
+    def _effective_batch_size(self, n_images: int, images: List[np.ndarray]) -> int:
+        if not self.dynamic_batch:
+            return self.batch_size
+
+        total_pixels = 0
+        for img in images:
+            if isinstance(img, np.ndarray) and img.ndim >= 2:
+                total_pixels += int(img.shape[0] * img.shape[1])
+
+        if n_images >= 120 or total_pixels >= 120 * 640 * 480:
+            return self.batch_size_very_large
+        if n_images >= self.parallel_min_images or total_pixels >= 60 * 640 * 480:
+            return self.batch_size_large
+        return self.batch_size
+
     @torch.inference_mode()
     def extract_xfeat_features(
         self, images: List[np.ndarray]
@@ -234,7 +268,13 @@ class XFeatMatcher:
             np.empty((0, 64), dtype=np.float32) for _ in range(n_images)
         ]
 
-        if self.batch_size <= 1:
+        effective_batch_size = self._effective_batch_size(n_images, images)
+        if effective_batch_size != self.batch_size:
+            print(
+                f"  XFeat dynamic extraction batch: {self.batch_size} -> {effective_batch_size}"
+            )
+
+        if effective_batch_size <= 1:
             for i, img in enumerate(images):
                 keypoints, descriptors = self._extract_single_image(img)
                 all_keypoints[i] = keypoints
@@ -242,27 +282,31 @@ class XFeatMatcher:
                 print(f"  Extracted {len(keypoints)} XFeat features from image #{i}")
             return all_keypoints, all_descriptors
 
-        prepared_images: List[np.ndarray] = [self._prepare_image(img) for img in images]
         buckets: Dict[Tuple[int, ...], List[int]] = {}
         fallback_indices: List[int] = []
 
-        for idx, img in enumerate(prepared_images):
+        for idx, img in enumerate(images):
             if not isinstance(img, np.ndarray):
                 fallback_indices.append(idx)
                 continue
             buckets.setdefault(tuple(img.shape), []).append(idx)
 
         for idx in fallback_indices:
-            keypoints, descriptors = self._extract_single_image(prepared_images[idx])
+            keypoints, descriptors = self._extract_single_image(images[idx])
             all_keypoints[idx] = keypoints
             all_descriptors[idx] = descriptors
 
         for _, indices in buckets.items():
-            for start in range(0, len(indices), self.batch_size):
-                chunk = indices[start : start + self.batch_size]
-                chunk_imgs = [prepared_images[i] for i in chunk]
+            for start in range(0, len(indices), effective_batch_size):
+                chunk = indices[start : start + effective_batch_size]
+                chunk_imgs_raw = [images[i] for i in chunk]
 
                 try:
+                    chunk_imgs = [self._prepare_image(img) for img in chunk_imgs_raw]
+                    if any(not isinstance(img, np.ndarray) for img in chunk_imgs):
+                        raise RuntimeError(
+                            "Non-numpy image found in XFeat batch preparation."
+                        )
                     stacked = np.stack(chunk_imgs, axis=0)
                     batch_tensor = torch.from_numpy(stacked)
                     if batch_tensor.dim() == 3:
@@ -290,9 +334,7 @@ class XFeatMatcher:
                         f"  XFeat batch extraction fallback on {len(chunk)} images ({exc})."
                     )
                     for image_idx in chunk:
-                        keypoints, descriptors = self._extract_single_image(
-                            prepared_images[image_idx]
-                        )
+                        keypoints, descriptors = self._extract_single_image(images[image_idx])
                         all_keypoints[image_idx] = keypoints
                         all_descriptors[image_idx] = descriptors
 
@@ -314,14 +356,14 @@ class XFeatMatcher:
         return t
 
     @torch.inference_mode()
-    def _match_descriptor_tensors(
+    def _match_descriptor_tensors_torch(
         self, t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if t1 is None or t2 is None or t1.numel() == 0 or t2.numel() == 0:
             return (
-                np.array([], dtype=np.int64),
-                np.array([], dtype=np.int64),
-                np.array([], dtype=np.float32),
+                torch.empty(0, dtype=torch.long, device=self.device),
+                torch.empty(0, dtype=torch.long, device=self.device),
+                torch.empty(0, dtype=torch.float32, device=self.device),
             )
 
         sim = t1 @ t2.t()
@@ -344,10 +386,18 @@ class XFeatMatcher:
         idx1 = match12[keep]
         scores = sim[idx0, idx1]
 
+        return idx0, idx1, scores
+
+    @torch.inference_mode()
+    def _match_descriptor_tensors(
+        self, t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        idx0, idx1, scores = self._match_descriptor_tensors_torch(t1, t2)
+
         return (
-            idx0.detach().cpu().numpy(),
-            idx1.detach().cpu().numpy(),
-            scores.detach().cpu().numpy(),
+            idx0.cpu().numpy(),
+            idx1.cpu().numpy(),
+            scores.cpu().numpy(),
         )
 
     @torch.inference_mode()
@@ -434,6 +484,128 @@ class XFeatMatcher:
 
         return sorted(pair_set)
 
+    def _build_cv2_matches(
+        self, idxs0: np.ndarray, idxs1: np.ndarray, scores: np.ndarray
+    ) -> List[cv2.DMatch]:
+        matches = []
+        for k in range(len(idxs0)):
+            distance = float(1.0 - scores[k])
+            matches.append(
+                cv2.DMatch(
+                    _queryIdx=int(idxs0[k]),
+                    _trainIdx=int(idxs1[k]),
+                    _distance=distance,
+                )
+            )
+        return matches
+
+    def _should_enable_cuda_parallel(
+        self, image_descriptors: List[np.ndarray], candidate_pairs: List[Tuple[int, int]]
+    ) -> bool:
+        if self.device.type != "cuda" or self.cuda_streams <= 1 or not candidate_pairs:
+            return False
+
+        mode = self.parallel_mode
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+
+        total_features = 0
+        feature_counts: List[int] = []
+        for desc in image_descriptors:
+            if desc is not None and desc.size > 0:
+                n_feat = int(desc.shape[0])
+                total_features += n_feat
+                feature_counts.append(n_feat)
+            else:
+                feature_counts.append(0)
+
+        if (
+            len(image_descriptors) >= self.parallel_min_images
+            or total_features >= self.parallel_min_total_features
+        ):
+            return True
+
+        if len(candidate_pairs) < self.parallel_min_pairs:
+            return False
+
+        if self.parallel_min_pair_work > 0:
+            pair_work = 0
+            for i, j in candidate_pairs:
+                ni = feature_counts[i]
+                nj = feature_counts[j]
+                if ni <= 0 or nj <= 0:
+                    continue
+                pair_work += ni * nj
+                if pair_work >= self.parallel_min_pair_work:
+                    return True
+
+        return False
+
+    @torch.inference_mode()
+    def _find_raw_matches_cuda_parallel(
+        self,
+        image_descriptors: List[np.ndarray],
+        candidate_pairs: List[Tuple[int, int]],
+        desc_tensors: List[Optional[torch.Tensor]],
+        max_matches: int,
+    ) -> Dict[Tuple[int, int], List[cv2.DMatch]]:
+        raw_matches_map: Dict[Tuple[int, int], List[cv2.DMatch]] = {}
+        streams = [torch.cuda.Stream(device=self.device) for _ in range(self.cuda_streams)]
+        print(
+            f"  Using CUDA parallel matching: {self.cuda_streams} streams, chunk={self.cuda_pair_chunk}"
+        )
+
+        for start in range(0, len(candidate_pairs), self.cuda_pair_chunk):
+            chunk = candidate_pairs[start : start + self.cuda_pair_chunk]
+
+            # Keep in-flight work bounded by stream count to avoid GPU memory spikes.
+            for wave_start in range(0, len(chunk), self.cuda_streams):
+                wave = chunk[wave_start : wave_start + self.cuda_streams]
+                launched = []
+                skipped = []
+
+                for stream_idx, (i, j) in enumerate(wave):
+                    desc1 = image_descriptors[i]
+                    desc2 = image_descriptors[j]
+                    if desc1.size == 0 or desc2.size == 0:
+                        skipped.append((i, j))
+                        continue
+
+                    stream = streams[stream_idx]
+                    with torch.cuda.stream(stream):
+                        idx0_t, idx1_t, scores_t = self._match_descriptor_tensors_torch(
+                            desc_tensors[i], desc_tensors[j]
+                        )
+                        if max_matches > 0 and scores_t.numel() > max_matches:
+                            top_idx = torch.topk(
+                                scores_t, k=max_matches, largest=True, sorted=False
+                            ).indices
+                            idx0_t = idx0_t[top_idx]
+                            idx1_t = idx1_t[top_idx]
+                            scores_t = scores_t[top_idx]
+                    launched.append((i, j, idx0_t, idx1_t, scores_t))
+
+                torch.cuda.synchronize(self.device)
+
+                for i, j in skipped:
+                    print(
+                        f"  Skipping match between image #{i} and #{j}: one or both have no descriptors."
+                    )
+
+                for i, j, idx0_t, idx1_t, scores_t in launched:
+                    idxs0 = idx0_t.cpu().numpy()
+                    idxs1 = idx1_t.cpu().numpy()
+                    scores = scores_t.cpu().numpy()
+                    matches = self._build_cv2_matches(idxs0, idxs1, scores)
+                    raw_matches_map[(i, j)] = matches
+                    print(
+                        f"  Image #{i} and Image #{j}: {len(matches)} raw matches (MNN)"
+                    )
+
+        return raw_matches_map
+
     def find_raw_matches(
         self, image_descriptors: List[np.ndarray]
     ) -> Dict[Tuple[int, int], List[cv2.DMatch]]:
@@ -463,6 +635,14 @@ class XFeatMatcher:
             self._prepare_descriptor_tensor(desc) for desc in image_descriptors
         ]
 
+        if self._should_enable_cuda_parallel(image_descriptors, candidate_pairs):
+            return self._find_raw_matches_cuda_parallel(
+                image_descriptors=image_descriptors,
+                candidate_pairs=candidate_pairs,
+                desc_tensors=desc_tensors,
+                max_matches=max_matches,
+            )
+
         for i, j in candidate_pairs:
             desc1 = image_descriptors[i]
             desc2 = image_descriptors[j]
@@ -480,16 +660,7 @@ class XFeatMatcher:
                 idxs0 = idxs0[top_idx]
                 idxs1 = idxs1[top_idx]
                 scores = scores[top_idx]
-            matches = []
-            for k in range(len(idxs0)):
-                distance = float(1.0 - scores[k])
-                matches.append(
-                    cv2.DMatch(
-                        _queryIdx=int(idxs0[k]),
-                        _trainIdx=int(idxs1[k]),
-                        _distance=distance,
-                    )
-                )
+            matches = self._build_cv2_matches(idxs0, idxs1, scores)
 
             raw_matches_map[(i, j)] = matches
             print(

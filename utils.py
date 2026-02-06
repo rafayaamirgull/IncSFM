@@ -679,6 +679,7 @@ def visualize_sfm_and_pose_open3d(
     point_colors: Optional[
         np.ndarray
     ] = None,  # Optional: N_points x 3 array of RGB colors (0-1)
+    point_voxel_size: float = 0.0,  # Optional voxel downsampling size for point cloud.
     camera_color: Tuple[float, float, float] = (0.0, 0.8, 0.0),  # Green for cameras
 ):
     """
@@ -710,6 +711,9 @@ def visualize_sfm_and_pose_open3d(
         pcd.colors = o3d.utility.Vector3dVector(
             np.tile(np.array([0.5, 0.5, 0.5]), (points_3D.shape[0], 1))
         )
+
+    if point_voxel_size and point_voxel_size > 0.0:
+        pcd = pcd.voxel_down_sample(float(point_voxel_size))
 
     geometries_to_draw = [pcd]
 
